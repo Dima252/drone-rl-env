@@ -5,8 +5,8 @@ different objectives on one shared environment. The end goal is sim-to-real
 transfer to physical hardware through ArduPilot and ROS 2.
 
 The environment is a working MuJoCo simulation of a single quadcopter, intended
-for hover stability, waypoint following and disturbance rejection. Training
-algorithms are not included.
+for hover stability, waypoint following and disturbance rejection. The scout
+drone has a PPO training script built on Stable Baselines3.
 
 ```text
 drone-rl-env/
@@ -21,7 +21,8 @@ drone-rl-env/
         ├── __init__.py
         ├── scout/
         │   ├── __init__.py
-        │   └── reward.py         # scout_reward (placeholder)
+        │   ├── reward.py         # scout_reward (placeholder)
+        │   └── train.py          # PPO training script
         └── payload/
             ├── __init__.py
             └── reward.py         # payload_reward (placeholder)
@@ -49,6 +50,18 @@ observation, reward, terminated, truncated, info = env.step(env.action_space.sam
 ```
 
 A new drone needs a new reward function and nothing else.
+
+## Training
+
+Run these from inside `drone_rl_workspace/`:
+
+```bash
+python -m agents.scout.train
+tensorboard --logdir runs/scout
+```
+
+Each run writes to `runs/scout/<run-name>/`. A saved model only works together
+with the `vecnormalize.pkl` saved beside it.
 
 ## How a step runs
 
