@@ -18,6 +18,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data as QOS
 from sensor_msgs.msg import Imu
+from std_msgs.msg import Float32MultiArray
 
 sys.path.insert(0, "/test")
 import make_const
@@ -27,6 +28,13 @@ TEST = Path("/test")
 POLICY = Path("/tmp/policy")
 USER_POLICY = Path("/policy")
 POLICY_SECONDS = float(os.environ.get("POLICY_SECONDS", "10"))
+# The stand-off to hold, and the distance the policy starts away from it.
+HOLD_RANGE_M = 10.0
+HOLD_HEIGHT_M = 4.0
+APPROACH_EXTRA_M = 5.0
+WAYPOINT_SECONDS = float(os.environ.get("WAYPOINT_SECONDS", "20"))
+HOLD_RADIUS_M = 1.5
+ANY_BOX = [0.0, 0.0, 0.2, 0.1]  # For constant policies, which ignore it.
 HEADING_DEG = 60.0
 ALT = 15.0
 RESULTS = []
@@ -93,6 +101,42 @@ class Pilot(Node):
         self.pset_cli = self.create_client(ParamSetV2, "/mavros/param/set")
         self.pget_cli = self.create_client(GetParameters, "/mavros/param/get_parameters")
         self.rate_cli = self.create_client(StreamRate, "/mavros/set_stream_rate")
+        self.marker_pub = self.create_publisher(Float32MultiArray, "/vision/marker_box", QOS)
+        self.box = list(ANY_BOX)  # What the fake detector reports; None reports nothing.
+        self.marker = None  # NED position of a fake marker, which overrides box.
+        self.create_timer(1 / 25, self.publish_marker)
+
+    def project_marker(self):
+        """Stand in for a camera and detector, from the vehicle's true pose."""
+        q = self.imu.orientation
+        R = T @ q2R([q.w, q.x, q.y, q.z]) @ F
+        half = 0.5 * CAMERA["marker_size_m"]
+        pitch = CAMERA["camera_pitch_down_rad"]
+        width = math.tan(CAMERA["horizontal_fov_rad"] / 2)
+        height = math.tan(CAMERA["vertical_fov_rad"] / 2)
+        xs, ys = [], []
+        for angle in np.linspace(0.0, 2 * math.pi, 16, endpoint=False):
+            north, east = half * math.cos(angle), half * math.sin(angle)
+            body = R.T @ (self.marker + np.array([north, east, 0.0]) - self.pos)
+            depth = math.cos(pitch) * body[0] + math.sin(pitch) * body[2]
+            down = -math.sin(pitch) * body[0] + math.cos(pitch) * body[2]
+            if depth < 0.1:
+                return None
+            xs.append(body[1] / depth / width)
+            ys.append(down / depth / height)
+        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        if abs(cx) > 1 or abs(cy) > 1:
+            return None
+        return [cx, cy, max(xs) - min(xs), max(ys) - min(ys)]
+
+    def publish_marker(self):
+        if self.imu is None or self.odom is None:
+            return
+        box = self.project_marker() if self.marker is not None else self.box
+        if box is not None:
+            m = Float32MultiArray()
+            m.data = [float(v) for v in box]
+            self.marker_pub.publish(m)
 
     def on_state(self, m):
         self.state = m
@@ -316,10 +360,12 @@ def settle(p, seconds=7.0):
 def run_policy(p, s, model, tag, seconds, **params):
     """Hand a constant policy control from LOITER; return samples taken while active."""
     settle(p, 5.0)
-    hover = dict(hover_thrust=HOVER[0], max_position_m=500.0)
+    # Constant policies ignore the hold, which only has to clear each altitude floor.
+    hover = dict(hover_thrust=HOVER[0], max_position_m=500.0, hold_height_m=40.0)
     hover.update(params)
     s.start_node(model, tag, **hover)
     assert s.wait_log("GUID_OPTIONS verified"), s.node_text()[-500:]
+    assert s.wait_log("Ready: select"), s.node_text()[-500:]
     before = len(p.set_t)
     start = time.monotonic()
     assert p.set_mode("GUIDED")
@@ -334,6 +380,7 @@ def run_policy(p, s, model, tag, seconds, **params):
 
 HOVER = [0.5]
 STACK = [None]
+CAMERA = {}
 
 
 def main():
@@ -341,6 +388,14 @@ def main():
     make_const.build(POLICY)
     for name in ("model.onnx", "policy_meta.npz"):
         shutil.copy(USER_POLICY / name, POLICY / name)
+    with np.load(POLICY / "policy_meta.npz") as meta:
+        for name in (
+            "horizontal_fov_rad",
+            "vertical_fov_rad",
+            "camera_pitch_down_rad",
+            "marker_size_m",
+        ):
+            CAMERA[name] = float(meta[name])
     rclpy.init()
     p = Pilot()
     ex = SingleThreadedExecutor()
@@ -556,6 +611,58 @@ def fly(p, s):
     )
     s.stop_node()
 
+    # ---- No marker in view: must never engage
+    settle(p, 3.0)
+    p.box = None
+    s.start_node("const_hover.onnx", "no_marker", hover_thrust=HOVER[0], max_position_m=500.0)
+    assert s.wait_log("GUID_OPTIONS verified"), s.node_text()[-500:]
+    assert s.wait_log("Ready: select"), s.node_text()[-500:]
+    before = len(p.set_t)
+    p.set_mode("GUIDED")
+    time.sleep(2)
+    check(
+        "no marker in view: refuses to engage",
+        len(p.set_t) == before and "no marker in view" in s.node_text(),
+        f"{len(p.set_t)-before} messages",
+    )
+    p.set_mode("LOITER")
+    p.box = list(ANY_BOX)
+    s.stop_node()
+
+    # ---- Marker lost in flight: level out at once, then LOITER
+    run_policy(p, s, "const_roll.onnx", "marker_lost", 1.2)
+    tilted = abs(p.rpy[0])
+    p.box = None
+    t0 = time.monotonic()
+    changed = wait_until(lambda: p.state.mode == "LOITER", 8.0)
+    elapsed = time.monotonic() - t0
+    reason = [l for l in s.node_text().splitlines() if "not in control" in l]
+    check(
+        "marker lost: hands over to LOITER",
+        changed and reason and "marker lost" in reason[0],
+        f"after {elapsed:.2f} s, tilt was {tilted:.2f} rad",
+    )
+    check(
+        "marker lost: levels out",
+        wait_until(lambda: abs(p.rpy[0]) < 0.05, 5.0),
+        f"roll {p.rpy[0]:+.3f} rad",
+    )
+    p.box = list(ANY_BOX)
+    s.stop_node()
+
+    # ---- Too close: the same response
+    run_policy(p, s, "const_hover.onnx", "too_close", 0.5)
+    p.box = [0.0, 0.0, 1.0, 0.6]
+    changed = wait_until(lambda: p.state.mode == "LOITER", 8.0)
+    reason = [l for l in s.node_text().splitlines() if "not in control" in l]
+    check(
+        "too close to the marker: hands over to LOITER",
+        changed and reason and "too close" in reason[0],
+        reason[0].split("control: ")[-1][:60] if reason else "NO REASON LOGGED",
+    )
+    p.box = list(ANY_BOX)
+    s.stop_node()
+
     # ---- Faults hand over to LOITER
     def handover(tag, model, trigger=None, wait=8.0, **params):
         run_policy(p, s, model, tag, 0.3, **params)
@@ -660,32 +767,69 @@ def fly(p, s):
     log(f"after thaw mode {p.state.mode}")
     s.stop_node()
 
-    # ---- The real exported network
-    samples = run_policy(
-        p,
-        s,
-        "model.onnx",
-        "trained",
-        POLICY_SECONDS,
-        max_position_m=200.0,
+    # ---- The real exported network, on the camera alone. The fake marker is placed
+    # ahead and below at the test altitude, so "ground" sits HOLD_HEIGHT_M underneath.
+    envelope = dict(
+        max_position_m=500.0,
         max_tilt_rad=0.6,
         max_speed_mps=12.0,
         min_altitude_m=4.0,
+        hold_range_m=HOLD_RANGE_M,
+        hold_height_m=HOLD_HEIGHT_M,
     )
+
+    def place_marker(distance):
+        heading = p.rpy[2]
+        ahead = np.array([math.cos(heading), math.sin(heading), 0.0])
+        p.marker = p.pos + distance * ahead + np.array([0.0, 0.0, HOLD_HEIGHT_M])
+
+    def hold_error(sample):
+        """Distance from the stand-off, with any bearing around the marker allowed."""
+        offset = sample[4] - p.marker
+        return math.hypot(
+            np.linalg.norm(offset[:2]) - HOLD_RANGE_M, -offset[2] - HOLD_HEIGHT_M
+        )
+
+    settle(p, 5.0)
+    log(f"policy checks start at {np.round(p.pos, 1)} m NED")
+    place_marker(HOLD_RANGE_M)
+    samples = run_policy(p, s, "model.onnx", "trained_hold", POLICY_SECONDS, **envelope)
     text = s.node_text()
     fault = [l for l in text.splitlines() if "not in control" in l]
-    moved = np.linalg.norm(samples[-1][4] - samples[0][4])
+    settled = samples[len(samples) // 2 :]
+    error = max(hold_error(x) for x in settled)
     tilts = [math.hypot(x[1][0], x[1][1]) for x in samples]
+    p.marker = None
     check(
         "your policy runs on real telemetry",
         "Policy engaged" in text and "Traceback" not in text,
-        f"moved {moved:.1f} m, max tilt {max(tilts):.2f} rad",
+        f"max tilt {max(tilts):.2f} rad",
     )
     check(
         f"your policy stays in the envelope for {POLICY_SECONDS:.0f} s",
         not fault,
         fault[0].split("control: ")[-1][:70] if fault else "no faults",
     )
+    check(
+        "your policy holds the stand-off on the camera alone",
+        not fault and error < HOLD_RADIUS_M,
+        f"worst error {error:.2f} m over the last half",
+    )
+    s.stop_node()
+
+    # ---- The real exported network: start further out, reach the stand-off and stop
+    settle(p, 5.0)
+    place_marker(HOLD_RANGE_M + APPROACH_EXTRA_M)
+    samples = run_policy(p, s, "model.onnx", "trained_approach", WAYPOINT_SECONDS, **envelope)
+    fault = [l for l in s.node_text().splitlines() if "not in control" in l]
+    final = hold_error(samples[-1])
+    speed = np.linalg.norm(samples[-1][2])
+    check(
+        "your policy reaches the stand-off and stops",
+        not fault and final < HOLD_RADIUS_M and speed < 1.0,
+        f"final error {final:.2f} m at {speed:.2f} m/s",
+    )
+    p.marker = None
     s.stop_node()
 
     # ---- Land

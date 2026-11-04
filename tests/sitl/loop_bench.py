@@ -16,12 +16,14 @@ def fake_mavros(stop):
     from rcl_interfaces.srv import GetParameters
     from rclpy.qos import qos_profile_sensor_data as Q
     from sensor_msgs.msg import Imu
+    from std_msgs.msg import Float32MultiArray
 
     rclpy.init()
     n = rclpy.create_node("fake_mavros")
     st = n.create_publisher(State, "/mavros/state", Q)
     imu = n.create_publisher(Imu, "/mavros/imu/data", Q)
     od = n.create_publisher(Odometry, "/mavros/local_position/odom", Q)
+    box = n.create_publisher(Float32MultiArray, "/vision/marker_box", Q)
 
     def params(req, res):
         res.values = [ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=8)]
@@ -42,6 +44,7 @@ def fake_mavros(stop):
         o.pose.pose.position.z = 15.0
         o.pose.pose.orientation.w = 1.0
         od.publish(o)
+        box.publish(Float32MultiArray(data=[0.0, 0.0, 0.2, 0.1]))
         count[0] += 1
         if count[0] % 10 == 0:
             s = State()

@@ -3,5 +3,7 @@ mujoco>=3.1
 numpy>=1.26
 onnx>=1.16
 onnxruntime>=1.18
+pytest>=8
 stable-baselines3>=2.3
 tensorboard>=2.15
+torch>=2.5,<3

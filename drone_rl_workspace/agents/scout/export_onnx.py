@@ -1,8 +1,8 @@
-"""Export a trained scout policy for ros2_inference_node.py.
+"""Export a trained policy for ros2_inference_node.py.
 
 Run from inside ``drone_rl_workspace``:
 
-    python -m agents.scout.export_onnx runs/scout/<run-name>
+    python -m agents.scout.export_onnx runs/<agent>/<run-name>
 
 By default this exports ``best_model/`` from the run into ``<run>/export/``. Use
 ``--model`` and ``--vecnormalize`` to export a checkpoint instead.
@@ -31,7 +31,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from agents.scout.train import make_env
 from envs import ControlMode
-from envs.base_drone_env import ACTION_DIM, OBS_DIM
+from envs.base_drone_env import ACTION_DIM
+from envs.marker_env import MARKER_OBS_DIM as OBS_DIM
 
 MAX_ACTION_ERROR = 1e-4
 CHECK_SAMPLES = 2000
@@ -106,9 +107,18 @@ def export_model(model: PPO, path: Path) -> None:
 def export_meta(stats: VecNormalize, config: dict, path: Path) -> None:
     """Save everything the node must reproduce, which the network cannot carry."""
     space = stats.observation_space
+    task = config["env"]["marker_task"]
     np.savez(
         path,
+        horizontal_fov_rad=task["horizontal_fov_rad"],
+        vertical_fov_rad=task["vertical_fov_rad"],
+        camera_pitch_down_rad=task["camera_pitch_down_rad"],
+        marker_size_m=task["marker_size_m"],
+        lost_timeout_s=task["lost_timeout_s"],
+        max_box_width=task["max_box_width"],
         control_mode=config["control_mode"],
+        control_hz=config["control_hz"],
+        action_filter_alpha=config["action_filter_alpha"],
         obs_mean=stats.obs_rms.mean,
         obs_var=stats.obs_rms.var,
         epsilon=stats.epsilon,

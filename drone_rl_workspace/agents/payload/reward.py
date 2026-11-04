@@ -1,4 +1,8 @@
-"""Reward for the payload drone: keep the airframe steady under load."""
+"""Reward for the payload drone: reach the hold with a steady airframe.
+
+Same task as the scout, traded towards steadiness: progress pays less, and tilt,
+body rates and abrupt commands cost more.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +10,18 @@ from typing import Any
 
 import numpy as np
 
+from agents.waypoint_reward import WaypointRewardWeights, waypoint_reward
 from envs import DroneState
 
-CRASH_PENALTY = 100.0
-TILT_WEIGHT = 1.0
-RATE_WEIGHT = 0.1
+WEIGHTS = WaypointRewardWeights(
+    progress=2.0,
+    proximity=1.0,
+    arrival=50.0,
+    smoothness=0.2,
+    tilt=0.5,
+    rate=0.1,
+    facing=0.3,
+)
 
 
 def payload_reward(
@@ -19,7 +30,4 @@ def payload_reward(
     next_state: DroneState,
     info: dict[str, Any],
 ) -> float:
-    """Placeholder objective, untuned: penalize tilt and body rates."""
-    rate = float(np.linalg.norm(next_state.angular_velocity))
-    crash = CRASH_PENALTY if info["terminated"] else 0.0
-    return -TILT_WEIGHT * next_state.tilt - RATE_WEIGHT * rate - crash
+    return waypoint_reward(WEIGHTS, state, action, next_state, info)

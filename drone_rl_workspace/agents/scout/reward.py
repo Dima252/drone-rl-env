@@ -1,4 +1,4 @@
-"""Reward for the scout drone: cover ground quickly with smooth commands."""
+"""Reward for the scout drone: reach the hold quickly with smooth commands."""
 
 from __future__ import annotations
 
@@ -6,10 +6,18 @@ from typing import Any
 
 import numpy as np
 
+from agents.waypoint_reward import WaypointRewardWeights, waypoint_reward
 from envs import DroneState
 
-CRASH_PENALTY = 100.0
-SMOOTHNESS_WEIGHT = 0.05
+WEIGHTS = WaypointRewardWeights(
+    progress=5.0,
+    proximity=1.0,
+    arrival=50.0,
+    smoothness=0.05,
+    tilt=0.0,
+    rate=0.02,
+    facing=0.3,
+)
 
 
 def scout_reward(
@@ -18,8 +26,4 @@ def scout_reward(
     next_state: DroneState,
     info: dict[str, Any],
 ) -> float:
-    """Placeholder objective, untuned: reward horizontal speed."""
-    speed = float(np.linalg.norm(next_state.velocity[:2]))
-    jerk = float(np.sum((action - info["prev_action"]) ** 2))
-    crash = CRASH_PENALTY if info["terminated"] else 0.0
-    return speed - SMOOTHNESS_WEIGHT * jerk - crash
+    return waypoint_reward(WEIGHTS, state, action, next_state, info)

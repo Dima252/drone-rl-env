@@ -6,6 +6,8 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
+OBS_DIM = 31
+
 ACTIONS = {
     "hover": [0, 0, 0, 0],
     "roll": [0.6, 0, 0, 0],
@@ -24,10 +26,10 @@ def build(output_dir: Path) -> None:
                 helper.make_node("Add", ["m", "B"], ["action"]),
             ],
             name,
-            [helper.make_tensor_value_info("observation", TensorProto.FLOAT, [1, 21])],
+            [helper.make_tensor_value_info("observation", TensorProto.FLOAT, [1, OBS_DIM])],
             [helper.make_tensor_value_info("action", TensorProto.FLOAT, [1, 4])],
             [
-                numpy_helper.from_array(np.zeros((21, 4), np.float32), "W"),
+                numpy_helper.from_array(np.zeros((OBS_DIM, 4), np.float32), "W"),
                 numpy_helper.from_array(np.array([action], np.float32), "B"),
             ],
         )

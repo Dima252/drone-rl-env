@@ -14,8 +14,8 @@
 
   Nominal values that other code relies on:
     * mass must equal DomainParams.mass_kg.
-    * ctrlrange gives a thrust-to-weight ratio of 2, which is what
-      DroneEnvConfig.hover_thrust = 0.5 assumes.
+    * ctrlrange gives a thrust-to-weight ratio of 2, which is the most any
+      randomized DomainParams.hover_thrust can draw from the motors.
 -->
 <mujoco model="quadcopter_sandbox">
   <compiler angle="radian" autolimits="true"/>
@@ -34,7 +34,7 @@
       <geom type="cylinder" size="0.06 0.004" rgba="0.8 0.3 0.1 0.6"/>
     </default>
     <!-- Force is in newtons. filterexact is first-order motor spin-up, and
-         gainprm[0] is overwritten by motor-efficiency randomization. -->
+         gainprm[0] and dynprm[0] are overwritten by domain randomization. -->
     <default class="motor">
       <general dyntype="filterexact" dynprm="0.03" gainprm="1" ctrlrange="0 7.36"/>
     </default>
@@ -44,7 +44,8 @@
     <light pos="0 0 -20" dir="0 0 1" directional="true"/>
     <geom name="ground" type="plane" size="100 100 0.1" euler="3.14159265 0 0" rgba="0.5 0.6 0.5 1"/>
 
-    <body name="drone" pos="0 0 -5">
+    <!-- simple="false" lets domain randomization move the centre of mass. -->
+    <body name="drone" pos="0 0 -5" simple="false">
       <freejoint name="root"/>
       <!-- Explicit inertial, so the geoms below are visual only. -->
       <inertial pos="0 0 0" mass="1.5" diaginertia="0.03 0.03 0.05"/>

@@ -28,6 +28,7 @@ fi
 docker build -t drone-sitl "$(native_path "$sitl_dir")"
 docker run --rm \
   -e POLICY_SECONDS="${POLICY_SECONDS:-10}" \
+  -e WAYPOINT_SECONDS="${WAYPOINT_SECONDS:-20}" \
   -v "$workspace:/ws:ro" \
   -v "$(native_path "$sitl_dir"):/test:ro" \
   -v "$policy:/policy:ro" \

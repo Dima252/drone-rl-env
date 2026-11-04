@@ -2,23 +2,43 @@
 """Fly a trained attitude policy through MAVROS and ArduPilot (ROS 2 Humble).
 
 The node never arms the vehicle or takes off. A pilot flies it to a safe altitude
-and selects GUIDED, which hands control to the policy. Leaving GUIDED takes control
-back at once. On any fault the node stops publishing and switches to
+and selects GUIDED, which hands control to the policy. Wait for the "Ready" log line
+first: selecting GUIDED before it is ignored. Leaving GUIDED takes control back at
+once. On any fault the node stops publishing and switches to
 ``fallback_mode``, and stays locked out until the pilot leaves GUIDED and selects
 it again.
 
     ros2 run <package> ros2_inference_node.py --ros-args \\
         -p model_path:=model.onnx -p policy_meta_path:=policy_meta.npz \\
-        -p hover_thrust:=0.42
+        -p hover_thrust:=0.42 -p hold_range_m:=10.0 -p hold_height_m:=4.0
+
+The policy holds ``hold_range_m`` from a static, round marker at ``hold_height_m``,
+facing it. It flies on the detector and the IMU alone. ``/mavros/local_position/odom`` never
+reaches the network: it only feeds the flight limits, and ArduPilot needs it for the
+``LOITER`` fallback. Without GPS, set ``fallback_mode`` to a mode that does not need a
+position, and ``required_mode`` to ``GUIDED_NOGPS``.
+
+A detector must publish ``std_msgs/Float32MultiArray`` on ``marker_topic``, holding
+``[cx, cy, w, h]`` in normalized image coordinates (x right and y down, -1 to 1 across
+the frame, so 2 fills it), only when it sees the marker. Keep the real camera close
+to ``MarkerTaskConfig`` in training.
+
+The pilot must point the camera at the marker before selecting GUIDED, or the node
+refuses to engage. If detections stop for ``lost_timeout_s``, the node commands level
+flight at hover thrust and asks for ``fallback_mode``. A box wider than
+``max_box_width`` means the vehicle is too close, and also ends policy control.
 
 Inputs:
 
-* ``model.onnx``: the deterministic actor. Input ``[1, 21]`` normalized observation
+* ``model.onnx``: the deterministic actor. Input ``[1, 31]`` normalized observation
   in float32, output ``[1, 4]`` action.
 * ``policy_meta.npz``: what training used, which the network file cannot carry.
-  Holds ``control_mode`` (must be ``attitude``), ``obs_mean``, ``obs_var``,
-  ``epsilon`` and ``clip_obs`` from VecNormalize, ``obs_low`` and ``obs_high`` from
-  the observation space, and ``max_attitude_cmd_rad`` and ``max_yaw_rate_rps``.
+  Holds ``control_mode`` (must be ``attitude``), ``control_hz`` (must equal
+  ``rate_hz``), ``action_filter_alpha``, ``obs_mean``, ``obs_var``, ``epsilon`` and
+  ``clip_obs`` from
+  VecNormalize, ``obs_low`` and ``obs_high`` from the observation space, and
+  ``max_attitude_cmd_rad`` and ``max_yaw_rate_rps``, and ``lost_timeout_s`` and
+  ``max_box_width`` from the task. The camera values in it are for the SITL suite.
 
 Vehicle setup. Each of these fails without an obvious error:
 
@@ -62,10 +82,13 @@ from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
+from std_msgs.msg import Float32MultiArray
 
 ACTION_DIM = 4
 SENSOR_DIM = 17
-OBS_DIM = SENSOR_DIM + ACTION_DIM
+BOX_DIM = 5
+BOX_LAGS = (0, 5, 10, 15)  # Control steps back from now.
+OBS_DIM = BOX_DIM * len(BOX_LAGS) + 2 + 3 + ACTION_DIM + 2
 
 # 180 degree rotations relating the two conventions. Each is its own inverse, so
 # the same conversion works in both directions.
@@ -128,6 +151,13 @@ def yaw_of(quaternion: np.ndarray) -> float:
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def roll_pitch_of(quaternion: np.ndarray) -> tuple[float, float]:
+    w, x, y, z = quaternion
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    return roll, pitch
+
+
 def tilt_of(quaternion: np.ndarray) -> float:
     _, x, y, _ = quaternion
     return math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (x * x + y * y))))
@@ -158,10 +188,45 @@ def pack_sensors(imu: Imu, odom: Odometry) -> np.ndarray:
             velocity,
             attitude,
             [gyro.x, -gyro.y, -gyro.z],
-            np.zeros(4),  # Vision slots: the sandbox trains with no target.
+            np.zeros(4),  # Unused: the detector arrives separately.
         ],
         dtype=np.float32,
     )
+
+
+def box_slots(message: Float32MultiArray | None, age_s: float, timeout_s: float) -> np.ndarray:
+    """Return [cx, cy, w, h, visible] from the newest detection, or all zeros."""
+    empty = np.zeros(BOX_DIM, dtype=np.float32)
+    if message is None or age_s > timeout_s or len(message.data) != 4:
+        return empty
+    box = np.array(message.data, dtype=np.float32)
+    if not np.all(np.isfinite(box)) or box[2] <= 0.0:
+        return empty
+    return np.append(box, np.float32(1.0))
+
+
+def build_observation(
+    boxes: list[np.ndarray],
+    sensors: np.ndarray,
+    prev_action: np.ndarray,
+    hold_range_m: float,
+    hold_height_m: float,
+) -> np.ndarray:
+    """Assemble the observation from the detector, the IMU and the mission only."""
+    return np.concatenate(
+        [
+            *[boxes[-1 - lag] for lag in BOX_LAGS],
+            roll_pitch_of(sensors[6:10]),
+            sensors[10:13],
+            prev_action,
+            [hold_range_m, hold_height_m],
+        ]
+    )
+
+
+def smooth_action(action: np.ndarray, previous: np.ndarray, alpha: float) -> np.ndarray:
+    """Apply the action filter the policy trained with."""
+    return (alpha * action + (1.0 - alpha) * previous).astype(np.float32)
 
 
 # ----------------------------------------------------------------------
@@ -180,6 +245,10 @@ class Policy:
                     f"Policy was trained for {control_mode!r} actions; this node "
                     "only publishes attitude targets."
                 )
+            self.control_hz = float(meta["control_hz"])
+            self.action_filter_alpha = float(meta["action_filter_alpha"])
+            self.lost_timeout_s = float(meta["lost_timeout_s"])
+            self.max_box_width = float(meta["max_box_width"])
             self.obs_mean = meta["obs_mean"].astype(np.float64)
             self.obs_scale = np.sqrt(meta["obs_var"].astype(np.float64) + meta["epsilon"])
             self.obs_low = meta["obs_low"].astype(np.float32)
@@ -280,6 +349,10 @@ class InferenceNode(Node):
         self.declare_parameter("max_position_m", 50.0)
         self.declare_parameter("max_speed_mps", 15.0)
         self.declare_parameter("max_tilt_rad", 0.7)
+        self.declare_parameter("hold_range_m", 10.0)
+        self.declare_parameter("hold_height_m", 4.0)
+        self.declare_parameter("marker_topic", "/vision/marker_box")
+        self.declare_parameter("marker_timeout_s", 0.2)
 
         param = lambda name: self.get_parameter(name).value  # noqa: E731
         self.period_s = 1.0 / param("rate_hz")
@@ -297,7 +370,17 @@ class InferenceNode(Node):
             max_speed_mps=param("max_speed_mps"),
             max_tilt_rad=param("max_tilt_rad"),
         )
+        self.marker_timeout_s = param("marker_timeout_s")
+        self.hold_range_m = param("hold_range_m")
+        self.hold_height_m = param("hold_height_m")
+        if self.hold_height_m < self.limits.min_altitude_m:
+            raise ValueError("hold_height_m is below min_altitude_m.")
         self.policy = Policy(param("model_path"), param("policy_meta_path"))
+        if param("rate_hz") != self.policy.control_hz:
+            raise ValueError(
+                f"rate_hz is {param('rate_hz')} but the policy trained at "
+                f"{self.policy.control_hz} Hz, so its dynamics would be wrong."
+            )
 
         # Starting locked means a restart in mid-flight cannot seize control: the
         # pilot must be seen leaving GUIDED first.
@@ -310,6 +393,10 @@ class InferenceNode(Node):
         self.state_time = -math.inf
         self.sensors: np.ndarray | None = None
         self.sensor_time = -math.inf
+        self.marker: Float32MultiArray | None = None
+        self.marker_time = -math.inf
+        self.boxes = [np.zeros(BOX_DIM, dtype=np.float32)] * (BOX_LAGS[-1] + 1)
+        self.levelling = False
 
         self.prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
         self.yaw_setpoint = 0.0
@@ -319,6 +406,9 @@ class InferenceNode(Node):
         # MAVROS publishes best-effort, so a reliable subscriber gets nothing.
         qos = qos_profile_sensor_data
         self.create_subscription(State, "/mavros/state", self.on_state, qos)
+        self.create_subscription(
+            Float32MultiArray, param("marker_topic"), self.on_marker, qos
+        )
         self.imu_sub = Subscriber(self, Imu, "/mavros/imu/data", qos_profile=qos)
         self.odom_sub = Subscriber(
             self, Odometry, "/mavros/local_position/odom", qos_profile=qos
@@ -358,11 +448,15 @@ class InferenceNode(Node):
         self.state = message
         self.state_time = time.monotonic()
 
+    def on_marker(self, message: Float32MultiArray) -> None:
+        self.marker = message
+        self.marker_time = time.monotonic()
+
     def on_sensors(self, imu: Imu, odom: Odometry) -> None:
         """Synchronized callback: pack the 17 sensor values of the observation.
 
-        The last 4 values, the previous action, are appended in the control tick,
-        which is the only place that knows the action just sent.
+        Only the IMU part reaches the policy. Position and velocity feed the flight
+        limits, in find_fault.
         """
         self.sensors = pack_sensors(imu, odom)
         self.sensor_time = time.monotonic()
@@ -424,11 +518,17 @@ class InferenceNode(Node):
                 self.get_logger().warning(
                     f"Pilot took control (mode {state.mode}, armed {state.armed})."
                 )
+            elif self.status is Status.LOCKED:
+                self.get_logger().info(f"Ready: select {self.required_mode} to engage.")
             self.status = Status.IDLE
             self.handover_pending = False
+            self.levelling = False
             return
 
         if self.status is Status.LOCKED:
+            if self.levelling and sensors is not None:
+                level = np.zeros(ACTION_DIM, dtype=np.float32)
+                self.attitude_pub.publish(self.make_setpoint(level, sensors))
             self.retry_handover(now)
             return
 
@@ -438,20 +538,40 @@ class InferenceNode(Node):
             self.lock_out(fault, handover=self.status is Status.ACTIVE)
             return
 
+        marker_age = now - self.marker_time
+        box = box_slots(self.marker, marker_age, self.marker_timeout_s)
+
         if self.status is Status.IDLE:
+            if not box[4]:
+                self.lock_out("no marker in view", handover=False)
+                return
+            self.boxes = [box] * (BOX_LAGS[-1] + 1)
             self.prev_action = np.zeros(ACTION_DIM, dtype=np.float32)
             self.yaw_setpoint = yaw_of(sensors[6:10])
             self.status = Status.ACTIVE
             self.get_logger().info("Policy engaged.")
 
-        observation = np.concatenate([sensors, self.prev_action])
+        if marker_age > self.policy.lost_timeout_s:
+            self.levelling = True
+            self.lock_out(f"marker lost for {marker_age:.2f} s", handover=True)
+            return
+        if box[2] > self.policy.max_box_width:
+            self.levelling = True
+            self.lock_out(f"too close to the marker: box width {box[2]:.2f}", handover=True)
+            return
+
+        self.boxes = self.boxes[1:] + [box]
+        observation = build_observation(
+            self.boxes, sensors, self.prev_action, self.hold_range_m, self.hold_height_m
+        )
         action = self.policy(observation)
         if not np.all(np.isfinite(action)):
             self.lock_out("non-finite policy output", handover=True)
             return
 
+        action = smooth_action(action, self.prev_action, self.policy.action_filter_alpha)
         self.attitude_pub.publish(self.make_setpoint(action, sensors))
-        self.prev_action = action.astype(np.float32)
+        self.prev_action = action
 
     def find_any_fault(self, sensors: np.ndarray | None, age_s: float) -> str | None:
         if not self.thrust_mode_verified:
