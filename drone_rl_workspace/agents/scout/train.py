@@ -12,11 +12,14 @@ only understands normalized observations:
     best_model/best_model.zip    + best_model/vecnormalize.pkl
     final/model.zip              + final/vecnormalize.pkl
     checkpoints/scout_<n>_steps.zip + checkpoints/scout_vecnormalize_<n>_steps.pkl
+
+Export a policy for the drone with ``python -m agents.scout.export_onnx``.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 from typing import Callable
@@ -31,7 +34,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
 from agents.scout.reward import scout_reward
-from envs import BaseDroneEnv, DroneEnvConfig
+from envs import BaseDroneEnv, ControlMode, DroneEnvConfig
 
 RUNS_DIR = Path(__file__).resolve().parents[2] / "runs" / "scout"
 
@@ -39,9 +42,17 @@ RUNS_DIR = Path(__file__).resolve().parents[2] / "runs" / "scout"
 GAMMA = 0.995
 
 
+def make_config() -> DroneEnvConfig:
+    """Return the training configuration.
+
+    Attitude control matches what ros2_inference_node.py publishes.
+    """
+    return DroneEnvConfig(control_mode=ControlMode.ATTITUDE)
+
+
 def make_env() -> BaseDroneEnv:
     """Build one environment. This runs inside each worker process."""
-    return BaseDroneEnv(reward_func=scout_reward, config=DroneEnvConfig())
+    return BaseDroneEnv(reward_func=scout_reward, config=make_config())
 
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
@@ -88,6 +99,20 @@ def main() -> None:
     final_dir = run_dir / "final"
     best_dir.mkdir(parents=True, exist_ok=True)
     final_dir.mkdir(parents=True, exist_ok=True)
+
+    # The exporter reads this, so a policy is always labelled with how it was
+    # actually trained, even if make_config changes later.
+    config = make_config()
+    (run_dir / "training_config.json").write_text(
+        json.dumps(
+            {
+                "control_mode": config.control_mode.value,
+                "max_attitude_cmd_rad": config.max_attitude_cmd_rad,
+                "max_yaw_rate_rps": config.max_yaw_rate_rps,
+            },
+            indent=2,
+        )
+    )
 
     # make_vec_env adds a Monitor to each worker, so the episode rewards and
     # lengths in TensorBoard are raw values, not the normalized rewards PPO sees.

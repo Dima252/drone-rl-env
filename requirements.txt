@@ -1,5 +1,7 @@
 gymnasium>=1.0
 mujoco>=3.1
 numpy>=1.26
+onnx>=1.16
+onnxruntime>=1.18
 stable-baselines3>=2.3
 tensorboard>=2.15

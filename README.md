@@ -17,12 +17,14 @@ drone-rl-env/
     ├── envs/
     │   ├── __init__.py
     │   └── base_drone_env.py     # BaseDroneEnv and its configuration
+    ├── ros2_inference_node.py    # Flies a policy through MAVROS (ROS 2 Humble)
     └── agents/
         ├── __init__.py
         ├── scout/
         │   ├── __init__.py
         │   ├── reward.py         # scout_reward (placeholder)
-        │   └── train.py          # PPO training script
+        │   ├── train.py          # PPO training script
+        │   └── export_onnx.py    # Exports a policy for the drone
         └── payload/
             ├── __init__.py
             └── reward.py         # payload_reward (placeholder)
@@ -62,6 +64,19 @@ tensorboard --logdir runs/scout
 
 Each run writes to `runs/scout/<run-name>/`. A saved model only works together
 with the `vecnormalize.pkl` saved beside it.
+
+## Deployment
+
+Export a trained run, from inside `drone_rl_workspace/`:
+
+```bash
+python -m agents.scout.export_onnx runs/scout/<run-name>
+```
+
+Copy `model.onnx`, `policy_meta.npz` and `ros2_inference_node.py` to the companion
+computer, which needs ROS 2 Humble, MAVROS, `numpy` and `onnxruntime`. The node's
+docstring lists the required vehicle setup. Several of those settings fail
+silently, so check each one.
 
 ## How a step runs
 
