@@ -1,8 +1,15 @@
 """Base Gymnasium environment shared by every drone in the workspace.
 
 Each drone differs only in the ``reward_func`` it injects, so all of them train
-on identical dynamics, sensors and latency. Physics is deliberately absent:
-subclasses implement ``_physics_reset`` and ``_physics_step``.
+on identical dynamics, sensors and latency. Dynamics come from MuJoCo, using the
+single-quadcopter model in ``assets/sandbox.xml``.
+
+Policies output setpoints, not motor commands. On hardware ArduPilot closes the
+loop from those setpoints to the motors, so the simulation needs a stand-in for
+it. A cascaded controller provides that here: velocity to attitude at the
+control rate, then attitude to body rates to motor thrusts at the physics rate.
+It reads true state, standing in for the autopilot's own state estimate, and it
+knows only the nominal vehicle, so randomized parameters are real disturbances.
 
 Conventions match ArduPilot/MAVLink so policies need no remapping on hardware
 (MAVROS converts to ROS ENU/FLU at its own boundary):
@@ -34,17 +41,21 @@ Observation (21 values, float32):
     ======  ==================  =====================================
 
 The previous action is part of the observation because the policy cannot infer
-the commands still in flight under latency without it.
+the commands still in flight under latency without it. The sandbox has no vision
+target, so indices 13-16 are always zero.
 """
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, SupportsFloat
 
 import gymnasium as gym
+import mujoco
 import numpy as np
 from gymnasium import spaces
 
@@ -52,6 +63,8 @@ ACTION_DIM = 4
 SENSOR_DIM = 17
 OBS_DIM = SENSOR_DIM + ACTION_DIM
 OBS_TARGET_VISIBLE = 16
+
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[1] / "assets" / "sandbox.xml"
 
 
 class ControlMode(str, Enum):
@@ -71,6 +84,8 @@ class DroneState:
         default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0])
     )
     angular_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    # Accelerometer output in the body frame, so level hover reads [0, 0, -g].
+    specific_force: np.ndarray = field(default_factory=lambda: np.zeros(3))
     target_offset: np.ndarray = field(default_factory=lambda: np.zeros(3))
     target_visible: bool = False
 
@@ -132,12 +147,31 @@ class SensorNoiseConfig:
 
 
 @dataclass(frozen=True)
+class FlightControllerConfig:
+    """Gains of the simulated autopilot. Retune to match the real vehicle."""
+
+    velocity_p: float = 4.0
+    velocity_i: float = 3.0
+    max_velocity_integral: float = 5.0  # m/s^2
+    attitude_p: float = 6.0
+    rate_p: tuple[float, float, float] = (15.0, 15.0, 4.0)  # roll, pitch, yaw
+    rate_i: float = 5.0
+    max_rate_integral: float = 10.0  # rad/s^2
+    max_yaw_torque_nm: float = 0.1
+
+
+@dataclass(frozen=True)
 class DroneEnvConfig:
     """Everything that is shared across drones and independent of the reward."""
 
     control_mode: ControlMode = ControlMode.VELOCITY
     control_hz: float = 50.0
     max_episode_steps: int = 1000
+    model_path: Path = DEFAULT_MODEL_PATH
+
+    # Initial pose: uniform over this box, with a uniform random heading.
+    spawn_xy_range_m: float = 5.0
+    spawn_altitude_m: tuple[float, float] = (5.0, 15.0)
 
     # Command limits: what a normalized action of +/-1 means.
     max_horizontal_speed_mps: float = 5.0
@@ -159,6 +193,18 @@ class DroneEnvConfig:
         default_factory=DomainRandomizationConfig
     )
     noise: SensorNoiseConfig = field(default_factory=SensorNoiseConfig)
+    controller: FlightControllerConfig = field(
+        default_factory=FlightControllerConfig
+    )
+
+
+def _quaternion_to_euler(quaternion: np.ndarray) -> tuple[float, float, float]:
+    """Return roll, pitch and yaw in radians (aerospace ZYX order)."""
+    w, x, y, z = quaternion
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return roll, pitch, yaw
 
 
 class BaseDroneEnv(gym.Env):
@@ -198,6 +244,40 @@ class BaseDroneEnv(gym.Env):
         self._last_action = np.zeros(ACTION_DIM, dtype=np.float32)
         self._action_queue: deque[np.ndarray] = deque()
         self._sensor_queue: deque[np.ndarray] = deque()
+
+        self._load_model()
+
+    def _load_model(self) -> None:
+        """Compile the MJCF and cache what the controller needs from it."""
+        model = mujoco.MjModel.from_xml_path(str(self.config.model_path))
+        self._model = model
+        self._data = mujoco.MjData(model)
+
+        substeps = self.dt / model.opt.timestep
+        if substeps < 1.0 or abs(substeps - round(substeps)) > 1e-9:
+            raise ValueError(
+                f"control_hz={self.config.control_hz} must divide the physics "
+                f"rate of {1.0 / model.opt.timestep:g} Hz."
+            )
+        self._substeps = round(substeps)
+
+        self._body_id = model.body("drone").id
+        self._nominal_mass = float(model.body_mass[self._body_id])
+        self._nominal_inertia = model.body_inertia[self._body_id].copy()
+        self._gravity = float(model.opt.gravity[2])
+        self._max_motor_thrust = float(model.actuator_ctrlrange[0, 1])
+        self._gyro = self._data.sensor("gyro")
+        self._accelerometer = self._data.sensor("accelerometer")
+
+        # Mixer: invert the map from motor thrusts to [thrust, torque xyz], built
+        # from the model so that motor layout and spin directions live in one place.
+        rotor_positions = model.site_pos[model.actuator_trnid[:, 0]]
+        gears = model.actuator_gear
+        torques = np.cross(rotor_positions, gears[:, :3]) + gears[:, 3:]
+        self._mixer = np.linalg.inv(np.vstack([-gears[:, 2], torques.T]))
+
+        self._velocity_integral = np.zeros(3)
+        self._rate_integral = np.zeros(3)
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -272,29 +352,155 @@ class BaseDroneEnv(gym.Env):
         return self._make_observation(sensors), reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
-    # Physics hooks: implement these to connect a simulator
+    # MuJoCo physics
     # ------------------------------------------------------------------
 
     def _physics_reset(self, domain: DomainParams) -> DroneState:
-        """Restart the simulator with ``domain`` applied; return the first state.
+        """Restart the simulation with ``domain`` applied; return the first state."""
+        model, data = self._model, self._data
 
-        This is where mass, wind and motor efficiency reach the dynamics. Use
-        ``self.np_random`` for any randomness so that seeding stays reproducible.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} has no physics backend: implement "
-            "_physics_reset and _physics_step."
+        # Inertia scales with mass, so the airframe keeps its shape.
+        model.body_mass[self._body_id] = domain.mass_kg
+        model.body_inertia[self._body_id] = self._nominal_inertia * (
+            domain.mass_kg / self._nominal_mass
         )
+        model.actuator_gainprm[:, 0] = domain.motor_efficiency
+        model.opt.wind[:] = domain.wind_ned_mps
+        mujoco.mj_setConst(model, data)
+        mujoco.mj_resetData(model, data)
+
+        cfg = self.config
+        rng = self.np_random
+        heading = rng.uniform(-np.pi, np.pi)
+        data.qpos[:2] = rng.uniform(-cfg.spawn_xy_range_m, cfg.spawn_xy_range_m, 2)
+        data.qpos[2] = -rng.uniform(*cfg.spawn_altitude_m)
+        data.qpos[3:7] = [math.cos(heading / 2), 0.0, 0.0, math.sin(heading / 2)]
+
+        # Start in flight with the motors already spinning at nominal hover.
+        data.act[:] = self._nominal_mass * self._gravity / 4.0
+        self._velocity_integral = np.zeros(3)
+        self._rate_integral = np.zeros(3)
+
+        mujoco.mj_forward(model, data)
+        return self._read_state()
 
     def _physics_step(self, command: np.ndarray, dt: float) -> DroneState:
-        """Advance the simulator by ``dt`` seconds and return the new state.
+        """Advance the simulation by ``dt`` seconds and return the new state.
 
         ``command`` holds physical units from ``_action_to_command``.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} has no physics backend: implement "
-            "_physics_reset and _physics_step."
+        model, data = self._model, self._data
+
+        if self.config.control_mode is ControlMode.VELOCITY:
+            roll, pitch, thrust = self._velocity_to_attitude(command[:3], dt)
+            yaw_rate = command[3]
+        else:
+            roll, pitch, yaw_rate = command[:3]
+            thrust = command[3] * 4.0 * self._max_motor_thrust
+
+        for _ in range(self._substeps):
+            data.ctrl[:] = self._attitude_to_motors(roll, pitch, yaw_rate, thrust)
+            mujoco.mj_step(model, data)
+
+        # mj_step leaves sensors one substep behind the integrated state.
+        mujoco.mj_forward(model, data)
+        return self._read_state()
+
+    def _read_state(self) -> DroneState:
+        """Copy the true state out of MuJoCo.
+
+        A free joint stores linear velocity in the world frame and angular
+        velocity in the body frame, which are the frames ``DroneState`` uses.
+        """
+        data = self._data
+        return DroneState(
+            position=data.qpos[:3].copy(),
+            velocity=data.qvel[:3].copy(),
+            quaternion=data.qpos[3:7].copy(),
+            angular_velocity=self._gyro.data.copy(),
+            specific_force=self._accelerometer.data.copy(),
         )
+
+    # ------------------------------------------------------------------
+    # Simulated flight controller
+    # ------------------------------------------------------------------
+
+    def _velocity_to_attitude(
+        self, velocity_cmd: np.ndarray, dt: float
+    ) -> tuple[float, float, float]:
+        """PI velocity loop: return roll, pitch and total thrust in newtons."""
+        cfg = self.config
+        gains = cfg.controller
+        data = self._data
+
+        error = velocity_cmd - data.qvel[:3]
+        self._velocity_integral = np.clip(
+            self._velocity_integral + gains.velocity_i * error * dt,
+            -gains.max_velocity_integral,
+            gains.max_velocity_integral,
+        )
+        accel_north, accel_east, accel_down = (
+            gains.velocity_p * error + self._velocity_integral
+        )
+
+        # Rotate the horizontal demand into the heading frame, then tilt towards
+        # it. In FRD, accelerating forward takes a negative pitch.
+        roll, pitch, yaw = _quaternion_to_euler(data.qpos[3:7])
+        cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+        accel_forward = cos_yaw * accel_north + sin_yaw * accel_east
+        accel_right = cos_yaw * accel_east - sin_yaw * accel_north
+        limit = cfg.max_attitude_cmd_rad
+        pitch_cmd = float(
+            np.clip(-math.atan2(accel_forward, self._gravity), -limit, limit)
+        )
+        roll_cmd = float(
+            np.clip(math.atan2(accel_right, self._gravity), -limit, limit)
+        )
+
+        # Divide by the tilt so the vertical component of thrust stays correct.
+        tilt_factor = max(math.cos(roll) * math.cos(pitch), 0.5)
+        thrust = self._nominal_mass * (self._gravity - accel_down) / tilt_factor
+        return roll_cmd, pitch_cmd, thrust
+
+    def _attitude_to_motors(
+        self, roll_cmd: float, pitch_cmd: float, yaw_rate_cmd: float, thrust: float
+    ) -> np.ndarray:
+        """Attitude P and rate PI loops, then the mixer: return motor thrusts."""
+        gains = self.config.controller
+        data = self._data
+
+        roll, pitch, _ = _quaternion_to_euler(data.qpos[3:7])
+        rate_cmd = np.array(
+            [
+                gains.attitude_p * (roll_cmd - roll),
+                gains.attitude_p * (pitch_cmd - pitch),
+                yaw_rate_cmd,
+            ]
+        )
+        rate_error = rate_cmd - data.qvel[3:6]
+        self._rate_integral = np.clip(
+            self._rate_integral
+            + gains.rate_i * rate_error * self._model.opt.timestep,
+            -gains.max_rate_integral,
+            gains.max_rate_integral,
+        )
+
+        torque = self._nominal_inertia * (
+            np.array(gains.rate_p) * rate_error + self._rate_integral
+        )
+        # Yaw authority is weak, so an unlimited demand would saturate the motors
+        # and take away the roll and pitch control that keeps the vehicle upright.
+        torque[2] = np.clip(
+            torque[2], -gains.max_yaw_torque_nm, gains.max_yaw_torque_nm
+        )
+        motors = self._mixer @ np.array([thrust, *torque])
+
+        # Attitude takes priority over thrust, as in ArduPilot: shift all motors
+        # together to stay in range, because clipping them one by one would
+        # remove the thrust differences that hold attitude.
+        motors += max(-motors.min(), 0.0)
+        motors -= max(motors.max() - self._max_motor_thrust, 0.0)
+        return motors
 
     # ------------------------------------------------------------------
     # Domain randomization (reset)

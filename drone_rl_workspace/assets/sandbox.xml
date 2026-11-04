@@ -1,0 +1,81 @@
+<!--
+  Single-quadcopter sandbox.
+
+  The world is modelled directly in NED and the body in FRD, matching
+  base_drone_env.py, so states need no frame conversion. Gravity therefore
+  points along +z and the ground plane is flipped to face -z. The MuJoCo viewer
+  shows the scene upside down as a result.
+
+  Contacts are disabled: the environment ends the episode when altitude falls
+  below zero, so the ground is only a visual reference.
+
+  Motors use ArduCopter X-frame numbering. Motors 1 and 2 spin counter-clockwise
+  seen from above, and motors 3 and 4 spin clockwise.
+
+  Nominal values that other code relies on:
+    * mass must equal DomainParams.mass_kg.
+    * ctrlrange gives a thrust-to-weight ratio of 2, which is what
+      DroneEnvConfig.hover_thrust = 0.5 assumes.
+-->
+<mujoco model="quadcopter_sandbox">
+  <compiler angle="radian" autolimits="true"/>
+
+  <!-- 400 Hz matches the ArduCopter main loop. Air density enables the drag
+       that carries opt.wind to the airframe. -->
+  <option timestep="0.0025" gravity="0 0 9.81" density="1.225" integrator="implicitfast">
+    <flag contact="disable"/>
+  </option>
+
+  <default>
+    <default class="arm">
+      <geom type="capsule" size="0.008" rgba="0.2 0.2 0.2 1"/>
+    </default>
+    <default class="rotor">
+      <geom type="cylinder" size="0.06 0.004" rgba="0.8 0.3 0.1 0.6"/>
+    </default>
+    <!-- Force is in newtons. filterexact is first-order motor spin-up, and
+         gainprm[0] is overwritten by motor-efficiency randomization. -->
+    <default class="motor">
+      <general dyntype="filterexact" dynprm="0.03" gainprm="1" ctrlrange="0 7.36"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 -20" dir="0 0 1" directional="true"/>
+    <geom name="ground" type="plane" size="100 100 0.1" euler="3.14159265 0 0" rgba="0.5 0.6 0.5 1"/>
+
+    <body name="drone" pos="0 0 -5">
+      <freejoint name="root"/>
+      <!-- Explicit inertial, so the geoms below are visual only. -->
+      <inertial pos="0 0 0" mass="1.5" diaginertia="0.03 0.03 0.05"/>
+
+      <geom name="frame" type="box" size="0.08 0.05 0.03" rgba="0.15 0.15 0.2 1"/>
+      <geom class="arm" fromto="-0.16 -0.16 0 0.16 0.16 0"/>
+      <geom class="arm" fromto="-0.16 0.16 0 0.16 -0.16 0"/>
+      <geom class="rotor" pos="0.16 0.16 -0.02"/>
+      <geom class="rotor" pos="-0.16 -0.16 -0.02"/>
+      <geom class="rotor" pos="0.16 -0.16 -0.02"/>
+      <geom class="rotor" pos="-0.16 0.16 -0.02"/>
+
+      <site name="imu"/>
+      <site name="rotor1" pos="0.16 0.16 0"/>   <!-- front right -->
+      <site name="rotor2" pos="-0.16 -0.16 0"/> <!-- rear left -->
+      <site name="rotor3" pos="0.16 -0.16 0"/>  <!-- front left -->
+      <site name="rotor4" pos="-0.16 0.16 0"/>  <!-- rear right -->
+    </body>
+  </worldbody>
+
+  <!-- gear is [force xyz, torque xyz] in the site frame: thrust acts along body
+       -z, and rotor drag torque opposes the spin direction. -->
+  <actuator>
+    <general class="motor" name="motor1" site="rotor1" gear="0 0 -1 0 0 0.016"/>
+    <general class="motor" name="motor2" site="rotor2" gear="0 0 -1 0 0 0.016"/>
+    <general class="motor" name="motor3" site="rotor3" gear="0 0 -1 0 0 -0.016"/>
+    <general class="motor" name="motor4" site="rotor4" gear="0 0 -1 0 0 -0.016"/>
+  </actuator>
+
+  <sensor>
+    <gyro name="gyro" site="imu"/>
+    <accelerometer name="accelerometer" site="imu"/>
+  </sensor>
+</mujoco>
