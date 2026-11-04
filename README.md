@@ -11,6 +11,8 @@ drone has a PPO training script built on Stable Baselines3.
 ```text
 drone-rl-env/
 ├── requirements.txt
+├── tests/
+│   └── sitl/                     # Flies policies on ArduCopter SITL in Docker
 └── drone_rl_workspace/
     ├── assets/
     │   └── sandbox.xml           # MuJoCo quadcopter model
@@ -77,6 +79,8 @@ Copy `model.onnx`, `policy_meta.npz` and `ros2_inference_node.py` to the compani
 computer, which needs ROS 2 Humble, MAVROS, `numpy` and `onnxruntime`. The node's
 docstring lists the required vehicle setup. Several of those settings fail
 silently, so check each one.
+
+Fly every policy in [SITL](tests/sitl/README.md) before it goes near hardware.
 
 ## How a step runs
 

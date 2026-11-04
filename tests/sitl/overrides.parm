@@ -1,0 +1,12 @@
+# Vehicle setup the inference node documents as required.
+GUID_TIMEOUT 0.5
+MAV1_EXTRA1 50
+MAV1_POSITION 50
+MAV1_EXTRA2 10
+MAV1_EXTRA3 2
+MAV1_RAW_SENS 2
+MAV1_RC_CHAN 2
+MAV1_PARAMS 50
+# Starts wrong on purpose: the first scenario proves the node refuses this.
+GUID_OPTIONS 0
+FRAME_TYPE 1
