@@ -8,9 +8,11 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 import pytest
+import torch
+from stable_baselines3 import PPO
 
 WORKSPACE = Path(__file__).parents[1] / "drone_rl_workspace"
-OBS_SIZE = 51
+OBS_SIZE = 53
 TINY = [
     "--n-envs", "2",
     "--n-workers", "2",
@@ -130,6 +132,7 @@ def test_a_lab_run_hands_on_to_a_realistic_run(trained):
     runs = trained.parent
     lab = f"{trained.name}_lab"
     realistic = f"{trained.name}_realistic"
+    other = f"{trained.name}_other_seed"
     try:
         result = run(
             "agents.scout.train", "--lab", "--total-timesteps", "4096",
@@ -150,15 +153,33 @@ def test_a_lab_run_hands_on_to_a_realistic_run(trained):
 
         result = run(
             "agents.scout.train", "--start-from", str(runs / lab),
-            "--total-timesteps", "4096", "--run-name", realistic, *TINY,
+            "--total-timesteps", "8192", "--run-name", realistic, *TINY,
         )
         assert result.returncode == 0, result.stderr[-2000:]
         assert "Starting from" in result.stdout
         config = json.loads((runs / realistic / "training_config.json").read_text())
         assert config["env"]["noise"]["enabled"] is True
+
+        result = run(
+            "agents.scout.train", "--start-from", str(runs / lab),
+            "--total-timesteps", "8192", "--run-name", other, *TINY, "--seed", "7",
+            "--ent-coef", "0.02",
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        first, second = (
+            PPO.load(runs / name / "final" / "model.zip", device="cpu")
+            for name in (realistic, other)
+        )
+        assert second.ent_coef == 0.02
+        weights = first.policy.state_dict()
+        assert any(
+            not torch.equal(weights[key], value)
+            for key, value in second.policy.state_dict().items()
+        )
     finally:
         shutil.rmtree(runs / lab, ignore_errors=True)
         shutil.rmtree(runs / realistic, ignore_errors=True)
+        shutil.rmtree(runs / other, ignore_errors=True)
 
 
 def test_payload_trains_with_the_same_machinery():

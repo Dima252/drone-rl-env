@@ -19,7 +19,7 @@ from envs import (
     SensorNoiseConfig,
 )
 from envs.base_drone_env import _euler_to_quaternion
-from envs.marker_env import BOX_LAGS, OBS_ACTION, OBS_ATTITUDE, OBS_HOLD, OBS_RATES
+from envs.marker_env import BOX_LAGS, OBS_ACTION, OBS_ATTITUDE, OBS_BARO, OBS_HOLD, OBS_RATES
 
 HOVER = np.zeros(4, dtype=np.float32)
 
@@ -83,7 +83,7 @@ def test_same_seed_same_episode():
 
 
 def test_gps_never_reaches_the_policy():
-    """Change only the position estimate: the observation must not move."""
+    """Change only the horizontal estimate: the observation must not move."""
     def rollout(error):
         env = make_env()
         env.reset(seed=3)
@@ -91,7 +91,7 @@ def test_gps_never_reaches_the_policy():
         env._gps_glitch = np.zeros(3)
         return [env.step(HOVER)[0] for _ in range(30)]
 
-    assert np.array_equal(rollout([0, 0, 0]), rollout([30, -20, 10]))
+    assert np.array_equal(rollout([0, 0, 0]), rollout([30, -20, 0]))
 
 
 def test_velocity_never_reaches_the_policy():
@@ -100,7 +100,37 @@ def test_velocity_never_reaches_the_policy():
         env._gps_velocity_error = np.array(velocity_error, dtype=float)
         return env.step(HOVER)[0]
 
-    assert np.array_equal(observation_with([0, 0, 0]), observation_with([5, 5, 5]))
+    assert np.array_equal(observation_with([0, 0, 0]), observation_with([5, 5, 0]))
+
+
+def test_the_barometer_gives_height_and_climb_rate():
+    env = perfect()
+    observation = env.step(HOVER)[0]
+    state = env._state
+    assert observation[OBS_BARO:] == pytest.approx(
+        [-state.position[2], -state.velocity[2]], abs=1e-4
+    )
+
+
+def test_barometer_drift_reaches_the_policy():
+    def height_with(error):
+        env = make_env()
+        env.reset(seed=3)
+        env._gps_position_error = np.array([0.0, 0.0, error])
+        env._gps_glitch = np.zeros(3)
+        return [env.step(HOVER)[0] for _ in range(10)][-1][OBS_BARO]
+
+    assert height_with(-1.0) - height_with(0.0) == pytest.approx(1.0, abs=0.2)
+
+
+def test_a_gps_glitch_leaves_the_height_alone():
+    env = make_env()
+    env.reset(seed=3)
+    env._gps_position_error = np.zeros(3)
+    env._gps_glitch = np.array([2.0, 0.0, 2.0])
+    error = env._read_gps(env._state)[0] - env._state.position
+    assert error[0] == pytest.approx(2.0, abs=0.5)
+    assert error[2] == pytest.approx(0.0, abs=0.5)
 
 
 # ---------------------------------------------------------------------- Field of view
@@ -275,7 +305,7 @@ def test_observation_layout():
         env._state.angular_velocity, abs=1e-4
     )
     assert observation[OBS_ACTION : OBS_ACTION + 4] == pytest.approx(env._last_action)
-    assert observation[OBS_HOLD:] == pytest.approx([env._hold_range, env._hold_height])
+    assert observation[OBS_HOLD:OBS_BARO] == pytest.approx([env._hold_range, env._hold_height])
 
 
 def test_history_holds_older_boxes_at_the_right_lags():

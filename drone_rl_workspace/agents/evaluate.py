@@ -64,6 +64,7 @@ def unseen(config: DroneEnvConfig) -> DroneEnvConfig:
             noise_scale=(2.0, 3.0),
             motor_lag_scale=(2.0, 2.5),
             action_delay_steps=(3, 4),
+            link_jitter_steps=(0, 1),
             link_drop_prob=(0.05, 0.1),
             push_force_n=(6.0, 8.0),
         ),

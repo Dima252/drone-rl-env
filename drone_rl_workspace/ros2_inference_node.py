@@ -13,10 +13,12 @@ it again.
         -p hover_thrust:=0.42 -p hold_range_m:=10.0 -p hold_height_m:=4.0
 
 The policy holds ``hold_range_m`` from a static, round marker at ``hold_height_m``,
-facing it. It flies on the detector and the IMU alone. ``/mavros/local_position/odom`` never
-reaches the network: it only feeds the flight limits, and ArduPilot needs it for the
-``LOITER`` fallback. Without GPS, set ``fallback_mode`` to a mode that does not need a
-position, and ``required_mode`` to ``GUIDED_NOGPS``.
+facing it. It flies on the detector, the IMU and the barometer. Only height and climb rate
+from ``/mavros/local_position/odom`` reach the network, so that height must stay valid
+without GPS and be measured from the marker's level. The rest of it only feeds the flight
+limits, and ArduPilot needs it for the ``LOITER`` fallback. Without GPS, set
+``fallback_mode`` to a mode that does not need a position, and ``required_mode`` to
+``GUIDED_NOGPS``.
 
 A detector must publish ``std_msgs/Float32MultiArray`` on ``marker_topic``, holding
 ``[cx, cy, w, h]`` in normalized image coordinates (x right and y down, -1 to 1 across
@@ -88,7 +90,7 @@ ACTION_DIM = 4
 SENSOR_DIM = 17
 BOX_DIM = 5
 BOX_LAGS = (0, 5, 10, 15, 20, 25, 30, 35)  # Control steps back from now.
-OBS_DIM = BOX_DIM * len(BOX_LAGS) + 2 + 3 + ACTION_DIM + 2
+OBS_DIM = BOX_DIM * len(BOX_LAGS) + 2 + 3 + ACTION_DIM + 2 + 2
 
 # 180 degree rotations relating the two conventions. Each is its own inverse, so
 # the same conversion works in both directions.
@@ -212,7 +214,7 @@ def build_observation(
     hold_range_m: float,
     hold_height_m: float,
 ) -> np.ndarray:
-    """Assemble the observation from the detector, the IMU and the mission only."""
+    """Assemble the observation from the detector, IMU, mission and barometer only."""
     return np.concatenate(
         [
             *[boxes[-1 - lag] for lag in BOX_LAGS],
@@ -220,6 +222,7 @@ def build_observation(
             sensors[10:13],
             prev_action,
             [hold_range_m, hold_height_m],
+            [-sensors[2], -sensors[5]],
         ]
     )
 

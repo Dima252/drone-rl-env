@@ -22,6 +22,8 @@ Action (normalized to [-1, 1], 4 values; all zeros is the neutral command):
 
 * ``ControlMode.VELOCITY``: ``[vx, vy, vz, yaw_rate]``, velocities in the world
   frame. Maps to MAVLink ``SET_POSITION_TARGET_LOCAL_NED``.
+* ``ControlMode.CLIMB``: ``[roll, pitch, yaw_rate, climb_rate]``. The autopilot holds
+  the climb rate, as ArduPilot does with ``GUID_OPTIONS`` bit 3 clear.
 * ``ControlMode.ATTITUDE``: ``[roll, pitch, yaw_rate, thrust]``. Maps to MAVLink
   ``SET_ATTITUDE_TARGET``. ArduPilot reads that thrust field as a climb rate
   unless ``GUID_OPTIONS`` bit 3 is set.
@@ -93,6 +95,7 @@ class ControlMode(str, Enum):
 
     VELOCITY = "velocity"
     ATTITUDE = "attitude"
+    CLIMB = "climb"
 
 
 @dataclass(frozen=True, eq=False)
@@ -166,16 +169,20 @@ class DomainParams:
 
 @dataclass(frozen=True)
 class DomainRandomizationConfig:
-    """Ranges sampled on every reset. Disable for nominal-vehicle evaluation."""
+    """Ranges sampled on every reset. Disable for nominal-vehicle evaluation.
+
+    Mass, inertia, motor lag, hover thrust and battery sag follow one reference build, a
+    Holybro X500 V2 on 4S. See docs/training-plan.md.
+    """
 
     enabled: bool = True
-    mass_kg: tuple[float, float] = (1.2, 1.8)
+    mass_kg: tuple[float, float] = (1.35, 1.65)
     # Applied on top of the scaling with mass.
-    inertia_scale: tuple[float, float] = (0.8, 1.25)
+    inertia_scale: tuple[float, float] = (0.9, 1.1)
     drag_scale: tuple[float, float] = (0.5, 1.5)
-    motor_lag_scale: tuple[float, float] = (0.7, 2.0)
+    motor_lag_scale: tuple[float, float] = (0.7, 1.7)
     attitude_gain_scale: tuple[float, float] = (0.7, 1.3)
-    hover_thrust: tuple[float, float] = (0.3, 0.5)
+    hover_thrust: tuple[float, float] = (0.35, 0.5)
     com_offset_std_m: float = 0.01
     wind_speed_mps: tuple[float, float] = (0.0, 5.0)
     updraft_mps: tuple[float, float] = (-1.0, 1.0)
@@ -185,7 +192,7 @@ class DomainRandomizationConfig:
     push_rate_hz: tuple[float, float] = (0.0, 0.2)
     push_force_n: tuple[float, float] = (0.0, 6.0)
     push_duration_s: float = 0.2
-    battery_sag: tuple[float, float] = (0.0, 0.08)
+    battery_sag: tuple[float, float] = (0.0, 0.02)
     motor_fault_prob: float = 0.1
     motor_fault_loss: tuple[float, float] = (0.05, 0.2)
     motor_efficiency: tuple[float, float] = (0.9, 1.0)
@@ -196,11 +203,14 @@ class DomainRandomizationConfig:
     gps_update_hz: tuple[float, float] = (5.0, 10.0)
     camera_tilt_error_std_rad: float = 0.03
     camera_frame_hz: tuple[float, float] = (15.0, 30.0)
-    camera_delay_steps: tuple[int, int] = (2, 5)
-    action_delay_steps: tuple[int, int] = (0, 3)
+    # Processing and transport, camera to motors, is these two added: 60 to 100 ms in
+    # 20 ms control steps. Frame age comes from camera_frame_hz, so it is not counted
+    # here. One step of jitter on each link would widen it to 20 to 140 ms.
+    camera_delay_steps: tuple[int, int] = (2, 3)
+    action_delay_steps: tuple[int, int] = (1, 2)
     gps_delay_steps: tuple[int, int] = (0, 2)
     imu_delay_steps: tuple[int, int] = (0, 2)
-    link_jitter_steps: tuple[int, int] = (0, 1)
+    link_jitter_steps: tuple[int, int] = (0, 0)
     link_drop_prob: tuple[float, float] = (0.0, 0.05)
 
 
@@ -773,6 +783,9 @@ class BaseDroneEnv(gym.Env):
         if self.config.control_mode is ControlMode.VELOCITY:
             roll, pitch, thrust = self._velocity_to_attitude(command[:3], dt)
             yaw_rate = float(command[3])
+        elif self.config.control_mode is ControlMode.CLIMB:
+            roll, pitch, yaw_rate, climb = command.tolist()
+            thrust = self._climb_to_thrust(climb, dt)
         else:
             roll, pitch, yaw_rate, throttle = command.tolist()
             weight = self._nominal_mass * self._gravity
@@ -905,6 +918,23 @@ class BaseDroneEnv(gym.Env):
         tilt_factor = max(math.cos(roll) * math.cos(pitch), 0.5)
         thrust = self._nominal_mass * (self._gravity - accel_down) / tilt_factor
         return roll_cmd, pitch_cmd, float(thrust)
+
+    def _climb_to_thrust(self, climb_cmd: float, dt: float) -> float:
+        """PI climb loop on the autopilot's own estimate: return total thrust in newtons."""
+        cfg = self.config
+        gains = cfg.controller
+        data = self._data
+        error = -climb_cmd - (data.qvel[2] + self._gps_velocity_error[2])
+        limit = gains.max_velocity_integral
+        held = min(max(self._velocity_integral[2] + gains.velocity_i * error * dt, -limit), limit)
+        self._velocity_integral[2] = held
+
+        roll, pitch, _ = _quaternion_to_euler(data.qpos[3:7].tolist())
+        tilt_factor = max(math.cos(roll) * math.cos(pitch), 0.5)
+        weight = self._nominal_mass * self._gravity
+        thrust = (weight - self._nominal_mass * (gains.velocity_p * error + held)) / tilt_factor
+        full = weight / self.domain.hover_thrust
+        return min(max(thrust, cfg.min_thrust * full), cfg.max_thrust * full)
 
     def _attitude_to_motors(
         self, roll_cmd: float, pitch_cmd: float, yaw_rate_cmd: float, thrust: float
@@ -1251,6 +1281,15 @@ class BaseDroneEnv(gym.Env):
                     cfg.max_horizontal_speed_mps,
                     cfg.max_vertical_speed_mps,
                     cfg.max_yaw_rate_rps,
+                ]
+            )
+        if cfg.control_mode is ControlMode.CLIMB:
+            return action * np.array(
+                [
+                    cfg.max_attitude_cmd_rad,
+                    cfg.max_attitude_cmd_rad,
+                    cfg.max_yaw_rate_rps,
+                    cfg.max_vertical_speed_mps,
                 ]
             )
 

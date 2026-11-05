@@ -167,17 +167,27 @@ def test_node_builds_the_same_observation_as_training(node):
     assert compared > 2 * BOX_LAGS[-1]
 
 
-def test_node_observation_ignores_position_and_velocity(node):
+def test_node_observation_ignores_horizontal_position_and_velocity(node):
     boxes = [np.zeros(BOX_DIM, dtype=np.float32)] * (BOX_LAGS[-1] + 1)
     sensors = np.zeros(SENSOR_DIM)
     sensors[6] = 1.0
     moved = sensors.copy()
-    moved[:6] = [40, -30, -20, 5, 5, 5]
+    moved[:6] = [40, -30, 0, 5, 5, 0]
     action = np.zeros(4, dtype=np.float32)
     assert np.array_equal(
         node.build_observation(boxes, sensors, action, 10.0, 4.0),
         node.build_observation(boxes, moved, action, 10.0, 4.0),
     )
+
+
+def test_node_observation_reads_height_and_climb_rate(node):
+    boxes = [np.zeros(BOX_DIM, dtype=np.float32)] * (BOX_LAGS[-1] + 1)
+    sensors = np.zeros(SENSOR_DIM)
+    sensors[6] = 1.0
+    sensors[2], sensors[5] = -4.0, -1.0
+    action = np.zeros(4, dtype=np.float32)
+    built = node.build_observation(boxes, sensors, action, 10.0, 4.0)
+    assert built[-2:] == pytest.approx([4.0, 1.0])
 
 
 def test_a_detection_becomes_a_visible_box(node):

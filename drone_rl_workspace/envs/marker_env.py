@@ -1,14 +1,15 @@
-"""Hold a steady position relative to a static marker, on camera and IMU alone.
+"""Hold a steady position relative to a static marker, on camera, IMU and barometer.
 
 A forward-facing camera, tilted down a little, feeds a bounding-box detector. The
-policy sees that detector's output and its own IMU, and never GPS. The camera and
-the detector are the only source of where the marker is, so:
+policy sees that detector's output, its own IMU and the barometer's height and climb
+rate, and never GPS. The camera and the detector are the only source of where the
+marker is, so:
 
 * If the vehicle yaws or pitches far enough for the marker to leave the field of
   view, the detections stop. Losing them for ``lost_timeout_s`` ends the episode, as
   it ends policy control on the vehicle.
-* Velocity is not measured. The policy infers motion from how the box changes, so
-  the observation holds a short history of boxes.
+* Horizontal velocity is not measured. The policy infers it from how the box changes,
+  so the observation holds a short history of boxes.
 
 The job is to hold a set range and height from the marker while facing it. A forward
 camera cannot see a marker beneath the vehicle, so this is a stand-off hold rather
@@ -16,16 +17,17 @@ than a hold overhead. Any bearing around the marker is acceptable. The marker is
 static, and a box that grows past ``max_box_width`` ends the episode, so approaching
 it closely is always a failure.
 
-Observation (51 values, float32):
+Observation (53 values, float32):
 
     ======  ===============================  ===================================
     Index   Field                            Source
     ======  ===============================  ===================================
     0-39    8 boxes: cx, cy, w, h, visible   Detector, newest first, 0.1 s apart
-    20-21   roll, pitch (rad)                IMU
-    22-24   body rates (rad/s)               IMU
-    25-28   previous action                  Policy, after the action filter
-    29-30   hold range, hold height (m)      Mission
+    40-41   roll, pitch (rad)                IMU
+    42-44   body rates (rad/s)               IMU
+    45-48   previous action                  Policy, after the action filter
+    49-50   hold range, hold height (m)      Mission
+    51-52   height (m), climb rate (m/s)     Barometer, through the autopilot's EKF
     ======  ===============================  ===================================
 
 Boxes are in normalized image coordinates: x right and y down, -1 to 1 across the
@@ -61,7 +63,8 @@ OBS_ATTITUDE = BOX_OBS_DIM
 OBS_RATES = OBS_ATTITUDE + 2
 OBS_ACTION = OBS_RATES + 3
 OBS_HOLD = OBS_ACTION + ACTION_DIM
-MARKER_OBS_DIM = OBS_HOLD + 2
+OBS_BARO = OBS_HOLD + 2
+MARKER_OBS_DIM = OBS_BARO + 2
 
 # A round marker, because box size is the only cue to range. A square's box changes
 # width by up to 41% with the viewing bearing, which is ambiguous by 2 m at 10 m.
@@ -220,6 +223,12 @@ class MarkerHoldEnv(BaseDroneEnv):
         noisy[2:] = np.maximum(noisy[2:], pixel)
         return noisy
 
+    def _read_gps(self, state: DroneState) -> tuple[np.ndarray, np.ndarray]:
+        """Keep GPS glitches out of the height: it comes from the barometer here."""
+        position, velocity = super()._read_gps(state)
+        position[2] -= self._gps_glitch[2]
+        return position, velocity
+
     def _on_sensors(self, sensors: np.ndarray) -> None:
         """Track what the vehicle receives, because that is what ends policy control."""
         self._latest_box = sensors[VISION_START:].astype(np.float64)
@@ -282,9 +291,17 @@ class MarkerHoldEnv(BaseDroneEnv):
         box_high = np.tile([1.0, 1.0, 2.0, 2.0, 1.0], len(BOX_LAGS))
         rates = np.full(3, cfg.max_angular_rate_rps)
         ones = np.ones(ACTION_DIM)
-        low = np.concatenate([box_low, [-np.pi, -np.pi], -rates, -ones, [0.0, 0.0]])
+        baro = np.array([cfg.max_position_m, cfg.sensor_max_speed_mps])
+        low = np.concatenate([box_low, [-np.pi, -np.pi], -rates, -ones, [0.0, 0.0], -baro])
         high = np.concatenate(
-            [box_high, [np.pi, np.pi], rates, ones, [task.hold_range_m[1], task.hold_height_m[1]]]
+            [
+                box_high,
+                [np.pi, np.pi],
+                rates,
+                ones,
+                [task.hold_range_m[1], task.hold_height_m[1]],
+                baro,
+            ]
         )
         return spaces.Box(low.astype(np.float32), high.astype(np.float32), dtype=np.float32)
 
@@ -305,6 +322,7 @@ class MarkerHoldEnv(BaseDroneEnv):
                 sensors[10:13],
                 self._last_action,
                 [self._hold_range, self._hold_height],
+                [-sensors[2], -sensors[5]],
             ]
         )
         return np.clip(

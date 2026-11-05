@@ -13,6 +13,7 @@ from agents.scout.train import make_config, next_difficulty
 from envs import (
     BaseDroneEnv,
     CameraConfig,
+    ControlMode,
     DomainParams,
     DomainRandomizationConfig,
     DroneEnvConfig,
@@ -717,18 +718,28 @@ def test_difficulty_scales_every_parameter_between_the_ends():
 @pytest.mark.parametrize(
     "waypoints, crashes, expected",
     [
-        ([1] * 50, [False] * 50, 0.55),  # Earned.
-        ([0] * 50, [False] * 50, 0.5),  # Survives without doing the job.
-        ([1] * 49, [False] * 49, 0.5),  # Too few episodes to judge.
-        ([2] * 50, [True] * 10 + [False] * 40, 0.5),  # Crashing too often.
+        ([5] * 50, [False] * 50, 0.55),  # Earned.
+        ([1] * 50, [False] * 50, 0.5),  # Survives, but barely does the job.
+        ([5] * 49, [False] * 49, 0.5),  # Too few episodes to judge.
+        ([6] * 50, [True] * 10 + [False] * 40, 0.5),  # Crashing too often.
     ],
 )
 def test_difficulty_rises_only_when_earned(waypoints, crashes, expected):
     assert next_difficulty(0.5, waypoints, crashes) == pytest.approx(expected)
 
 
+def test_camera_to_motor_latency_fits_the_budget():
+    cfg = DomainRandomizationConfig()
+    step_s = 1.0 / make_config().control_hz
+    fastest = (cfg.camera_delay_steps[0] + cfg.action_delay_steps[0]) * step_s
+    slowest = (cfg.camera_delay_steps[1] + cfg.action_delay_steps[1]) * step_s
+    assert fastest == pytest.approx(0.06)
+    assert slowest == pytest.approx(0.10)
+    assert cfg.link_jitter_steps == (0, 0)  # Any jitter breaks the window.
+
+
 def test_difficulty_stops_at_one():
-    assert next_difficulty(0.98, [2] * 60, [False] * 60) == 1.0
+    assert next_difficulty(0.98, [6] * 60, [False] * 60) == 1.0
 
 
 def test_environments_default_to_full_difficulty():
@@ -1003,3 +1014,50 @@ def test_rgb_array_shows_the_drone():
         env.close()
     assert frame.shape == (480, 640, 3)
     assert frame.std() > 1.0
+
+
+def climb_env(mass_kg=1.5):
+    env = BaseDroneEnv(
+        reward_func=lambda *_: 0.0,
+        config=dataclasses.replace(
+            make_config(),
+            control_mode=ControlMode.CLIMB,
+            randomization=dataclasses.replace(make_config().randomization, enabled=False),
+            noise=dataclasses.replace(make_config().noise, enabled=False),
+        ),
+    )
+    env.reset(seed=0)
+    env.domain = dataclasses.replace(env.domain, mass_kg=mass_kg)
+    env._model.body_mass[env._body_id] = mass_kg
+    return env
+
+
+def test_climb_mode_scales_the_fourth_action_to_a_climb_rate():
+    env = climb_env()
+    command = env._action_to_command(np.array([0, 0, 0, 1.0], dtype=np.float32))
+    assert command[3] == pytest.approx(env.config.max_vertical_speed_mps)
+
+
+@pytest.mark.parametrize("mass_kg", [1.35, 1.5, 1.65])
+def test_climb_mode_holds_height_whatever_the_mass(mass_kg):
+    env = climb_env(mass_kg)
+    command = np.zeros(4)
+    for _ in range(400):
+        state = env._physics_step(command, env.dt)
+    assert abs(state.velocity[2] + env._gps_velocity_error[2]) < 0.02
+
+
+def test_climb_mode_climbs_at_the_commanded_rate():
+    env = climb_env()
+    command = np.array([0.0, 0.0, 0.0, 1.5])
+    for _ in range(150):
+        state = env._physics_step(command, env.dt)
+    assert -state.velocity[2] == pytest.approx(1.5, abs=0.05)
+
+
+def test_climb_mode_stays_inside_the_throttle_limits():
+    env = climb_env()
+    weight = env._nominal_mass * env._gravity
+    full = weight / env.domain.hover_thrust
+    assert env._climb_to_thrust(100.0, env.dt) == pytest.approx(env.config.max_thrust * full)
+    assert env._climb_to_thrust(-100.0, env.dt) == pytest.approx(env.config.min_thrust * full)

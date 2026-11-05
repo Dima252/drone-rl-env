@@ -57,7 +57,7 @@ they report, and fly for longer than the default.
 
 ## If you change the observation or action space
 
-The node, `make_const.py` and the exporter all assume 51 observations and 4 actions.
+The node, `make_const.py` and the exporter all assume 53 observations and 4 actions.
 Change all three together, and update `build_observation` in the node so that each
 new value is built the same way as in training. `tests/test_node_parity.py` compares
 the two.

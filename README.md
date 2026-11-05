@@ -5,8 +5,8 @@ different objectives on one shared environment. The end goal is sim-to-real
 transfer to physical hardware through ArduPilot and ROS 2.
 
 The main task is `MarkerHoldEnv`: a single quadcopter in MuJoCo holds a set range and
-height from a static ground marker, flying on a forward camera's detector boxes and
-its IMU, and never GPS. `BaseDroneEnv` underneath it also offers a GPS waypoint task.
+height from a static ground marker, flying on a forward camera's detector boxes, its
+IMU and barometer, and never GPS. `BaseDroneEnv` underneath it also offers a GPS waypoint task.
 The scout and payload drones share the marker task
 and differ only in their reward weights. Both train with PPO from Stable Baselines3.
 
@@ -27,7 +27,7 @@ drone-rl-env/
     ├── envs/
     │   ├── __init__.py
     │   ├── base_drone_env.py     # BaseDroneEnv and its configuration
-    │   └── marker_env.py         # MarkerHoldEnv: camera and IMU only
+    │   └── marker_env.py         # MarkerHoldEnv: camera, IMU and barometer
     ├── ros2_inference_node.py    # Flies a policy through MAVROS (ROS 2 Humble)
     └── agents/
         ├── __init__.py
@@ -185,9 +185,10 @@ Point the camera at the marker before selecting GUIDED, or the node refuses to
 engage. If the marker is lost for `lost_timeout_s`, or the box grows past
 `max_box_width`, the node commands level flight and requests `LOITER`.
 
-The network never reads GPS. The node's flight limits and the `LOITER` fallback still
-need ArduPilot's position estimate, so a vehicle without GPS must change
-`fallback_mode` and `required_mode`.
+The network never reads GPS. It reads height and climb rate from ArduPilot's estimate,
+so that height must stay valid without GPS and be measured from the marker's level. The
+node's flight limits and the `LOITER` fallback still need the full position estimate,
+so a vehicle without GPS must change `fallback_mode` and `required_mode`.
 
 Set up ArduPilot's own protection as well, because the node cannot replace it:
 `FENCE_ENABLE`, `BATT_FS_*`, `FS_THR_ENABLE` and `FS_EKF_ACTION`. Keep a pilot on the

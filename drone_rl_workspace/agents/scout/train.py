@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import os
 import platform
 import re
 import subprocess
@@ -78,9 +79,11 @@ ENT_COEF = 0.003
 
 # Randomization rises only once the policy does the job at the current level. A
 # timed ramp outruns learning: difficulty reached 0.5 with no waypoints completed.
+# So did a gate of one hold a flight: a lab model reached 0.6, where it completes too
+# few holds to learn from, stalled there for 20M steps and forgot the lab task.
 CURRICULUM_STEP = 0.05
 CURRICULUM_MIN_EPISODES = 50
-CURRICULUM_MIN_WAYPOINTS = 1.0  # Mean per episode.
+CURRICULUM_MIN_WAYPOINTS = 5.0  # Mean per episode.
 CURRICULUM_MAX_CRASH_RATE = 0.05
 
 # Normalization statistics weigh new data against the samples behind them. After a
@@ -94,7 +97,7 @@ def make_config() -> DroneEnvConfig:
 
     Attitude control matches what ros2_inference_node.py publishes.
     """
-    return DroneEnvConfig(control_mode=ControlMode.ATTITUDE)
+    return DroneEnvConfig(control_mode=ControlMode(os.environ.get("DRONE_CONTROL_MODE", "attitude")))
 
 
 def lab_config(config: DroneEnvConfig) -> DroneEnvConfig:
@@ -260,6 +263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-eval-episodes", type=int, default=64)
     parser.add_argument("--checkpoint-freq", type=int, default=500_000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--ent-coef", type=float, default=ENT_COEF)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", default=time.strftime("%Y%m%d-%H%M%S"))
     parser.add_argument(
@@ -351,10 +355,16 @@ def train(agent: str, reward_func: RewardFunc) -> None:
             env=train_env,
             device="cpu",
             update_device=args.update_device,
-            custom_objects={"learning_rate": schedule, "lr_schedule": schedule},
+            custom_objects={
+                "learning_rate": schedule,
+                "lr_schedule": schedule,
+                "ent_coef": args.ent_coef,
+            },
             tensorboard_log=str(run_dir / "tensorboard"),
         )
         model.num_timesteps = 0
+        # Loading reseeds everything with the saved run's seed, so --seed needs reapplying.
+        model.set_random_seed(args.seed)
         print(f"Starting from {args.start_from}.")
     else:
         model = GraphedPPO(
@@ -367,7 +377,7 @@ def train(agent: str, reward_func: RewardFunc) -> None:
             gamma=GAMMA,
             gae_lambda=GAE_LAMBDA,
             clip_range=0.2,
-            ent_coef=ENT_COEF,
+            ent_coef=args.ent_coef,
             # A starting std of about 0.37 keeps early actions from saturating at
             # the +/-1 limits.
             policy_kwargs={
