@@ -8,6 +8,16 @@ Run from inside ``drone_rl_workspace``:
 Each run writes to ``runs/scout/<run-name>/``. To continue an interrupted run from
 its latest checkpoint, pass the same ``--run-name`` with ``--resume``.
 
+Training has two stages. ``--lab`` trains on the nominal vehicle in still air with
+perfect sensors, so a failure there is the task's and not the conditions'. Then
+``--start-from runs/scout/<lab-run>`` starts a new run from that model, and the
+curriculum brings in the real conditions.
+
+Rollouts run on the CPU across ``--n-workers`` processes, and gradient steps run on
+the GPU when there is one. See agents/batched_vec_env.py and agents/graphed_ppo.py.
+To train several models at once, start each in its own terminal with its own
+``--run-name`` and ``--seed``, and share the CPU out with ``--n-workers``.
+
 To use a trained policy, load a model together with the VecNormalize file saved
 beside it, because the policy only understands normalized observations:
 
@@ -28,19 +38,21 @@ import platform
 import re
 import subprocess
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
-from stable_baselines3 import PPO
+import torch
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CheckpointCallback,
     EvalCallback,
 )
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import VecNormalize
 
+from agents.batched_vec_env import BatchedVecEnv
+from agents.graphed_ppo import GraphedPPO
 from agents.scout.reward import scout_reward
 from envs import ControlMode, DroneEnvConfig, MarkerHoldEnv, RewardFunc
 
@@ -51,12 +63,22 @@ PACKAGES = ("gymnasium", "mujoco", "numpy", "stable-baselines3", "torch")
 # At the 50 Hz control rate this looks about 4 seconds ahead.
 GAMMA = 0.995
 
+# Experience per update. n_steps follows from n_envs, so adding environments does
+# not change how much PPO sees between updates.
+ROLLOUT_SIZE = 16_384
+BATCH_SIZE = 256
+
 # Randomization rises only once the policy does the job at the current level. A
 # timed ramp outruns learning: difficulty reached 0.5 with no waypoints completed.
 CURRICULUM_STEP = 0.05
 CURRICULUM_MIN_EPISODES = 50
 CURRICULUM_MIN_WAYPOINTS = 1.0  # Mean per episode.
 CURRICULUM_MAX_CRASH_RATE = 0.05
+
+# Normalization statistics weigh new data against the samples behind them. After a
+# lab run those are too many to ever follow dropouts the lab never showed, so a run
+# that starts from another keeps only this many.
+START_FROM_STATS_COUNT = 100_000
 
 
 def make_config() -> DroneEnvConfig:
@@ -67,16 +89,29 @@ def make_config() -> DroneEnvConfig:
     return DroneEnvConfig(control_mode=ControlMode.ATTITUDE)
 
 
-def make_env(reward_func: RewardFunc = scout_reward) -> MarkerHoldEnv:
+def lab_config(config: DroneEnvConfig) -> DroneEnvConfig:
+    """The nominal vehicle in still air with perfect sensors."""
+    return replace(
+        config,
+        randomization=replace(config.randomization, enabled=False),
+        noise=replace(config.noise, enabled=False),
+    )
+
+
+def make_env(reward_func: RewardFunc = scout_reward, lab: bool = False) -> MarkerHoldEnv:
     """Build one environment. This runs inside each worker process."""
-    return MarkerHoldEnv(reward_func=reward_func, config=make_config())
+    config = lab_config(make_config()) if lab else make_config()
+    return MarkerHoldEnv(reward_func=reward_func, config=config)
 
 
 def linear_schedule(initial_value: float) -> Callable[[float], float]:
-    """Decay linearly to zero. SB3 passes progress remaining, from 1 down to 0."""
+    """Decay linearly to zero. SB3 passes progress remaining, from 1 down to 0.
+
+    The last rollout can overshoot the budget, which takes progress below 0.
+    """
 
     def schedule(progress_remaining: float) -> float:
-        return progress_remaining * initial_value
+        return max(progress_remaining, 0.0) * initial_value
 
     return schedule
 
@@ -200,23 +235,49 @@ def describe_run(agent: str, config: DroneEnvConfig, args: argparse.Namespace) -
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--total-timesteps", type=int, default=10_000_000)
-    parser.add_argument("--n-envs", type=int, default=8)
-    parser.add_argument("--eval-freq", type=int, default=50_000)
-    parser.add_argument("--n-eval-episodes", type=int, default=20)
+    parser.add_argument("--n-envs", type=int, default=64)
+    parser.add_argument(
+        "--n-workers", type=int, default=16, help="processes to run the environments on"
+    )
+    parser.add_argument(
+        "--n-steps", type=int, help="steps per environment per update; default fills ROLLOUT_SIZE"
+    )
+    parser.add_argument(
+        "--update-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="where gradient steps run; auto uses the GPU if PyTorch can see one",
+    )
+    parser.add_argument("--eval-freq", type=int, default=250_000)
+    parser.add_argument("--n-eval-episodes", type=int, default=64)
     parser.add_argument("--checkpoint-freq", type=int, default=500_000)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", default=time.strftime("%Y%m%d-%H%M%S"))
     parser.add_argument(
+        "--lab",
+        action="store_true",
+        help="train and evaluate in perfect conditions, with no curriculum",
+    )
+    start = parser.add_mutually_exclusive_group()
+    start.add_argument(
         "--resume",
         action="store_true",
         help="continue --run-name from its latest checkpoint",
+    )
+    start.add_argument(
+        "--start-from",
+        type=Path,
+        help="start a new run from the best model of this run, with a fresh schedule",
     )
     return parser.parse_args()
 
 
 def train(agent: str, reward_func: RewardFunc) -> None:
     args = parse_args()
+    if args.update_device == "auto":
+        args.update_device = "cuda" if torch.cuda.is_available() else "cpu"
+    args.n_steps = args.n_steps or ROLLOUT_SIZE // args.n_envs
     run_dir = RUNS_DIR / agent / args.run_name
     best_dir = run_dir / "best_model"
     final_dir = run_dir / "final"
@@ -229,62 +290,86 @@ def train(agent: str, reward_func: RewardFunc) -> None:
     if not args.resume:
         config_path.write_text(
             json.dumps(
-                describe_run(agent, make_config(), args), indent=2, default=str
+                describe_run(
+                    agent, lab_config(make_config()) if args.lab else make_config(), args
+                ),
+                indent=2,
+                default=str,
             )
         )
 
-    # make_vec_env adds a Monitor to each worker, so the episode rewards and
+    # With the updates on the GPU, the CPU only answers small batches during rollouts,
+    # and extra threads would just compete with the workers.
+    if args.update_device == "cuda":
+        torch.set_num_threads(1)
+
+    # BatchedVecEnv adds a Monitor to each environment, so the episode rewards and
     # lengths in TensorBoard are raw values, not the normalized rewards PPO sees.
-    # spawn is the only start method on Windows, and is safe on every platform.
-    env_kwargs = {"reward_func": reward_func}
-    train_env = make_vec_env(
-        make_env,
-        n_envs=args.n_envs,
-        seed=args.seed,
-        env_kwargs=env_kwargs,
-        vec_env_cls=SubprocVecEnv,
-        vec_env_kwargs={"start_method": "spawn"},
-    )
+    build_env = partial(make_env, reward_func=reward_func, lab=args.lab)
+    train_env = BatchedVecEnv(build_env, args.n_envs, args.n_workers, seed=args.seed)
     if args.resume:
         model_path, stats_path = find_latest_checkpoint(run_dir, agent)
         train_env = VecNormalize.load(str(stats_path), train_env)
+    elif args.start_from:
+        train_env = VecNormalize.load(
+            str(args.start_from / "best_model" / "vecnormalize.pkl"), train_env
+        )
+        train_env.obs_rms.count = min(train_env.obs_rms.count, START_FROM_STATS_COUNT)
+        train_env.ret_rms.count = min(train_env.ret_rms.count, START_FROM_STATS_COUNT)
     else:
         train_env = VecNormalize(
             train_env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=GAMMA
         )
 
     # The evaluation environment must not update the statistics, and reports raw
-    # rewards. EvalCallback copies the training statistics in before each run.
-    eval_env = make_vec_env(
-        make_env, n_envs=1, seed=args.seed + args.n_envs, env_kwargs=env_kwargs
+    # rewards. EvalCallback copies the training statistics in before each run. Every
+    # episode flies at once, because flying them in turn took longer than training.
+    eval_env = BatchedVecEnv(
+        build_env, args.n_eval_episodes, args.n_workers, seed=args.seed + args.n_envs
     )
     eval_env = VecNormalize(
         eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.0
     )
 
     if args.resume:
-        model = PPO.load(model_path, env=train_env, device="cpu")
+        model = GraphedPPO.load(
+            model_path, env=train_env, device="cpu", update_device=args.update_device
+        )
         print(f"Resuming from {model_path} at {model.num_timesteps} steps.")
+    elif args.start_from:
+        schedule = linear_schedule(args.learning_rate)
+        model = GraphedPPO.load(
+            args.start_from / "best_model" / "best_model.zip",
+            env=train_env,
+            device="cpu",
+            update_device=args.update_device,
+            custom_objects={"learning_rate": schedule, "lr_schedule": schedule},
+            tensorboard_log=str(run_dir / "tensorboard"),
+        )
+        model.num_timesteps = 0
+        print(f"Starting from {args.start_from}.")
     else:
-        model = PPO(
+        model = GraphedPPO(
             "MlpPolicy",
             train_env,
             learning_rate=linear_schedule(args.learning_rate),
-            n_steps=2048,
-            batch_size=256,
+            n_steps=args.n_steps,
+            batch_size=BATCH_SIZE,
             n_epochs=10,
             gamma=GAMMA,
             gae_lambda=0.95,
             clip_range=0.2,
             ent_coef=0.0,
-            # A small MLP runs faster on the CPU. A starting std of about 0.37
-            # keeps early actions from saturating at the +/-1 limits.
+            # A starting std of about 0.37 keeps early actions from saturating at
+            # the +/-1 limits.
             policy_kwargs={
                 "net_arch": {"pi": [256, 256], "vf": [256, 256]},
                 "log_std_init": -1.0,
             },
             tensorboard_log=str(run_dir / "tensorboard"),
+            # A small MLP answers faster on the CPU, so rollouts stay there.
             device="cpu",
+            update_device=args.update_device,
             seed=args.seed,
             verbose=1,
         )
@@ -312,7 +397,7 @@ def train(agent: str, reward_func: RewardFunc) -> None:
         model.learn(
             total_timesteps=args.total_timesteps - model.num_timesteps,
             callback=[
-                CurriculumCallback(run_dir / "curriculum.txt"),
+                *([] if args.lab else [CurriculumCallback(run_dir / "curriculum.txt")]),
                 eval_callback,
                 checkpoint_callback,
                 EpisodeMetricsCallback(),

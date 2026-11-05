@@ -168,7 +168,7 @@ def test_node_builds_the_same_observation_as_training(node):
 
 
 def test_node_observation_ignores_position_and_velocity(node):
-    boxes = [np.zeros(BOX_DIM, dtype=np.float32)] * 16
+    boxes = [np.zeros(BOX_DIM, dtype=np.float32)] * (BOX_LAGS[-1] + 1)
     sensors = np.zeros(SENSOR_DIM)
     sensors[6] = 1.0
     moved = sensors.copy()
@@ -338,7 +338,7 @@ def test_node_policy_normalizes_like_vecnormalize(node, tmp_path):
 
 def test_node_refuses_a_policy_with_the_wrong_observation_size(node, tmp_path):
     save_meta(tmp_path / "meta.npz", np.zeros(24), np.ones(24), 1e-8, 10.0, np.zeros(24), np.ones(24))
-    with pytest.raises(ValueError, match="Expected 31"):
+    with pytest.raises(ValueError, match=f"Expected {MARKER_OBS_DIM}"):
         node.Policy("unused.onnx", str(tmp_path / "meta.npz"))
 
 
@@ -369,7 +369,7 @@ def tick_node(node, **overrides):
             action_filter_alpha=0.5,
             return_value=np.zeros(4, dtype=np.float32),
         ),
-        boxes=[np.zeros(BOX_DIM, dtype=np.float32)] * 16,
+        boxes=[np.zeros(BOX_DIM, dtype=np.float32)] * (BOX_LAGS[-1] + 1),
         prev_action=np.zeros(4, dtype=np.float32),
         levelling=False,
         hold_range_m=10.0,

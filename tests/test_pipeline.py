@@ -10,8 +10,11 @@ import onnxruntime as ort
 import pytest
 
 WORKSPACE = Path(__file__).parents[1] / "drone_rl_workspace"
+OBS_SIZE = 51
 TINY = [
     "--n-envs", "2",
+    "--n-workers", "2",
+    "--n-steps", "2048",
     "--eval-freq", "2048",
     "--n-eval-episodes", "1",
     "--checkpoint-freq", "2048",
@@ -108,17 +111,54 @@ def test_export_matches_what_the_node_expects(trained):
     assert result.returncode == 0, result.stderr[-2000:]
 
     session = ort.InferenceSession(str(trained / "export" / "model.onnx"))
-    assert session.get_inputs()[0].shape == [1, 31]
-    action = session.run(None, {"observation": np.zeros((1, 31), np.float32)})[0]
+    assert session.get_inputs()[0].shape == [1, OBS_SIZE]
+    action = session.run(None, {"observation": np.zeros((1, OBS_SIZE), np.float32)})[0]
     assert action.shape == (1, 4)
 
     with np.load(trained / "export" / "policy_meta.npz") as meta:
         assert float(meta["control_hz"]) == 50.0
         assert float(meta["action_filter_alpha"]) == 0.5
         assert str(meta["control_mode"]) == "attitude"
-        assert meta["obs_mean"].shape == (31,)
+        assert meta["obs_mean"].shape == (OBS_SIZE,)
         assert float(meta["max_box_width"]) == 0.8
         assert float(meta["lost_timeout_s"]) == 0.5
+
+
+def test_a_lab_run_hands_on_to_a_realistic_run(trained):
+    import shutil
+
+    runs = trained.parent
+    lab = f"{trained.name}_lab"
+    realistic = f"{trained.name}_realistic"
+    try:
+        result = run(
+            "agents.scout.train", "--lab", "--total-timesteps", "4096",
+            "--run-name", lab, *TINY,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        config = json.loads((runs / lab / "training_config.json").read_text())
+        assert config["env"]["noise"]["enabled"] is False
+        assert config["env"]["randomization"]["enabled"] is False
+        assert not (runs / lab / "curriculum.txt").exists()
+
+        result = run(
+            "agents.evaluate", str(runs / lab), "--lab", "--episodes", "1",
+            "--max-crash-rate", "1.0",
+        )
+        assert "nominal" in result.stdout
+        assert "randomized" not in result.stdout
+
+        result = run(
+            "agents.scout.train", "--start-from", str(runs / lab),
+            "--total-timesteps", "4096", "--run-name", realistic, *TINY,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert "Starting from" in result.stdout
+        config = json.loads((runs / realistic / "training_config.json").read_text())
+        assert config["env"]["noise"]["enabled"] is True
+    finally:
+        shutil.rmtree(runs / lab, ignore_errors=True)
+        shutil.rmtree(runs / realistic, ignore_errors=True)
 
 
 def test_payload_trains_with_the_same_machinery():

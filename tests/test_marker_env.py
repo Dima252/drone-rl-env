@@ -10,6 +10,7 @@ from gymnasium.utils.env_checker import check_env
 
 from agents.scout import scout_reward
 from agents.scout.train import make_config, make_env
+from agents.waypoint_reward import WaypointRewardWeights, waypoint_reward
 from envs import (
     MARKER_OBS_DIM,
     DomainRandomizationConfig,
@@ -160,6 +161,17 @@ def test_box_width_does_not_depend_on_the_viewing_bearing():
             env._project_marker(position, _euler_to_quaternion(0.0, 0.0, bearing + math.pi))[2]
         )
     assert max(widths) == pytest.approx(min(widths), rel=0.03)
+
+
+def test_the_detector_is_perfect_at_difficulty_zero():
+    """The realistic stage must start where the lab left off."""
+    env = MarkerHoldEnv(scout_reward, make_config())
+    env.set_difficulty(0.0)
+    env.reset(seed=0)
+    truth = pose(env)
+    assert truth.any()
+    for _ in range(500):
+        assert env._detect_box(env._state) == pytest.approx(truth)
 
 
 def test_too_small_a_box_is_not_detected():
@@ -392,6 +404,26 @@ def test_reward_prefers_facing_the_marker():
         return env.step(HOVER)[1]
 
     assert step_reward(0.0) > step_reward(0.4)
+
+
+def test_sliding_along_the_ring_earns_no_progress():
+    """The hold point follows the vehicle, so it must not pay for being followed."""
+    weights = WaypointRewardWeights(
+        progress=1.0, proximity=0.0, arrival=0.0, smoothness=0.0, tilt=0.0, rate=0.0
+    )
+    env = MarkerHoldEnv(
+        lambda *args: waypoint_reward(weights, *args), perfect().config
+    )
+    env.reset(seed=0)
+    env._hold_range, env._hold_height = 10.0, 4.0
+    pose(env, distance=10.0, height=4.0)
+    env._data.qvel[1] = 5.0
+    mujoco.mj_forward(env._model, env._data)
+    env._state = env._read_state()
+    env._waypoint = env._ring_point(env._state.position)
+
+    _, reward, *_ = env.step(HOVER)
+    assert abs(reward) < 0.005  # A 5 m/s slide covers 0.1 m in one step.
 
 
 def test_nothing_pays_for_flying_past_the_hold_towards_the_marker():

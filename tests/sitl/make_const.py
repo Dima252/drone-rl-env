@@ -6,7 +6,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-OBS_DIM = 31
+OBS_DIM = 51
 
 ACTIONS = {
     "hover": [0, 0, 0, 0],

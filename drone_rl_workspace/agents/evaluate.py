@@ -10,6 +10,8 @@ gate an export. A policy has to do the job as well as survive, because hovering 
 place never crashes. The worst case only limits crashes: it pins every range at its
 hard end at once, where staying safe is the job.
 
+``--lab`` judges a lab run on ``nominal`` alone, with a higher bar.
+
 ``unseen`` flies conditions beyond every training range. The gap between it and
 ``randomized`` is the direct measure of overfitting to those ranges. ``hold m`` is
 the true distance from the hold point while settled there.
@@ -29,17 +31,8 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from agents.scout.train import make_config, make_env
+from agents.scout.train import lab_config, make_config, make_env
 from envs import DroneEnvConfig, MarkerHoldEnv
-
-
-def nominal(config: DroneEnvConfig) -> DroneEnvConfig:
-    """The nominal vehicle in still air with perfect sensors."""
-    return dataclasses.replace(
-        config,
-        randomization=dataclasses.replace(config.randomization, enabled=False),
-        noise=dataclasses.replace(config.noise, enabled=False),
-    )
 
 
 def worst_case(config: DroneEnvConfig) -> DroneEnvConfig:
@@ -78,13 +71,15 @@ def unseen(config: DroneEnvConfig) -> DroneEnvConfig:
 
 
 SCENARIOS = {
-    "nominal": nominal,
+    "nominal": lab_config,
     "randomized": lambda config: config,
     "worst case": worst_case,
     "unseen": unseen,
 }
 # These only have to stay safe, because each is harder than the job as specified.
 SAFETY_ONLY = {"worst case": "max_worst_case_crash_rate", "unseen": "max_unseen_crash_rate"}
+# A lab run must beat the final bar, because the realistic stage will cost it some.
+LAB_MIN_WAYPOINT_RATE = 0.9
 
 
 def fly(
@@ -150,6 +145,11 @@ def parse_args() -> argparse.Namespace:
         default=0.8,
         help="share of episodes completing a hold, except the last two scenarios",
     )
+    parser.add_argument(
+        "--lab",
+        action="store_true",
+        help="judge a lab run: the nominal scenario alone, at LAB_MIN_WAYPOINT_RATE",
+    )
     return parser.parse_args()
 
 
@@ -168,14 +168,16 @@ def main() -> None:
         f"{'scenario':12s} {'crashes':>8s} {'wp/min':>7s} {'any wp':>7s} "
         f"{'err m':>6s} {'hold m':>7s} {'tilt95':>7s} {'jerk':>6s}  causes"
     )
-    for name, build in SCENARIOS.items():
+    scenarios = {"nominal": lab_config} if args.lab else SCENARIOS
+    min_waypoint_rate = LAB_MIN_WAYPOINT_RATE if args.lab else args.min_waypoint_rate
+    for name, build in scenarios.items():
         result = fly(model, stats, build(make_config()), args.episodes, args.seed)
         if name in SAFETY_ONLY:
             ok = result["crash_rate"] <= getattr(args, SAFETY_ONLY[name])
         else:
             ok = (
                 result["crash_rate"] <= args.max_crash_rate
-                and result["any_waypoint"] >= args.min_waypoint_rate
+                and result["any_waypoint"] >= min_waypoint_rate
             )
         passed = passed and ok
         print(

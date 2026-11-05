@@ -18,6 +18,7 @@ drone-rl-env/
 │   ├── test_env.py               # Dynamics, sensors, latency, waypoints, reward
 │   ├── test_marker_env.py        # Field of view, detector, the stand-off hold
 │   ├── test_node_parity.py       # Training and the flight node must agree
+│   ├── test_fast_training.py     # The fast path must only change the speed
 │   ├── test_pipeline.py          # Train, resume, evaluate and export for real
 │   └── sitl/                     # Flies policies on ArduCopter SITL in Docker
 └── drone_rl_workspace/
@@ -32,6 +33,8 @@ drone-rl-env/
         ├── __init__.py
         ├── waypoint_reward.py    # Reward shared by every drone
         ├── evaluate.py           # Measures a trained policy
+        ├── batched_vec_env.py    # Many environments on a few worker processes
+        ├── graphed_ppo.py        # PPO with its updates on the GPU
         ├── scout/
         │   ├── __init__.py
         │   ├── reward.py         # scout_reward: fast and smooth
@@ -51,8 +54,12 @@ decisions](docs/training-plan.md) before training.
 ```bash
 python -m venv .venv
 source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install torch --index-url https://download.pytorch.org/whl/cu130    # NVIDIA GPU
 pip install -r requirements.txt
 ```
+
+The first `pip install` is what lets PyTorch use the GPU: the default Windows build is
+CPU-only. Without a GPU, skip it, and training does its updates on the CPU.
 
 Run code from inside `drone_rl_workspace/` so that `envs` and `agents` import. Run
 the tests from the repository root:
@@ -92,11 +99,51 @@ To continue an interrupted run, repeat its name with `--resume`. It restarts fro
 the latest checkpoint, and `--total-timesteps` still means the length of the whole
 run.
 
+### Speed
+
+Measured on a Ryzen 7 7800X3D and an RTX 5070 Ti, before and after the changes that
+made training faster:
+
+| | Before | After |
+| --- | --- | --- |
+| One environment, steps per second | 2,214 | About 4,500 |
+| Collecting a 16,384-step rollout | 4.01 s | 0.82 s |
+| One PPO update | 1.76 s | 0.23 s |
+| One evaluation | 13.9 s | 1.5 s |
+| Whole run, steps per second | About 1,600 | About 14,000 |
+
+- The simulation does the same arithmetic faster, so its results are bit-identical.
+- Rollouts stay on the CPU. Each worker runs several environments, because a round
+  trip to a worker costs more than a step. `--n-envs 128` measured about 10% faster
+  than the default 64, and halves `n_steps` again.
+- Gradient steps run on the GPU from a CUDA graph, with the same maths and batch size.
+  Without a graph the GPU is slower than the CPU at batch size 256, because the
+  network is small and each launch costs more than its work. `--update-device cpu`
+  turns this off.
+- To train two models at once, start each in its own terminal with a different
+  `--run-name` and `--seed`, and `--n-workers 8`. Together they measured 1.3 times
+  the throughput of one run, with each one about two thirds as fast. That suits
+  comparing settings, while one run at a time gives the fastest single answer.
+
 Watch `rollout/crash_rate`, `rollout/waypoints_reached` (completed holds) and `eval/success_rate` in
 TensorBoard. Reward alone cannot show what a policy is doing. `rollout/difficulty`
-shows the curriculum: randomization starts at the nominal vehicle and rises only
+shows the curriculum: randomization and sensor errors start at none and rise only
 while the policy completes waypoints without crashing. If it stalls below 1, the run
 never trained on the full ranges, even though evaluation always uses them.
+
+Training has two stages, so that a failure can be traced to the task or to the
+conditions:
+
+```bash
+python -m agents.scout.train --lab --run-name lab --total-timesteps 20000000
+python -m agents.evaluate runs/scout/lab --lab --episodes 200
+python -m agents.scout.train --start-from runs/scout/lab --run-name realistic --total-timesteps 20000000
+```
+
+`--lab` trains and evaluates on the nominal vehicle in still air with perfect sensors,
+with no curriculum. `--start-from` starts a new run from that run's best model, with a
+fresh learning-rate schedule. Its normalization statistics keep little weight, so they
+can follow the dropouts and noise the lab never showed.
 
 ## Evaluation
 

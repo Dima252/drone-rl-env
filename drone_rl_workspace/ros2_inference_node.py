@@ -87,7 +87,7 @@ from std_msgs.msg import Float32MultiArray
 ACTION_DIM = 4
 SENSOR_DIM = 17
 BOX_DIM = 5
-BOX_LAGS = (0, 5, 10, 15)  # Control steps back from now.
+BOX_LAGS = (0, 5, 10, 15, 20, 25, 30, 35)  # Control steps back from now.
 OBS_DIM = BOX_DIM * len(BOX_LAGS) + 2 + 3 + ACTION_DIM + 2
 
 # 180 degree rotations relating the two conventions. Each is its own inverse, so

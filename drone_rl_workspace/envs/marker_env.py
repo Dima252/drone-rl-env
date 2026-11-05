@@ -16,12 +16,12 @@ than a hold overhead. Any bearing around the marker is acceptable. The marker is
 static, and a box that grows past ``max_box_width`` ends the episode, so approaching
 it closely is always a failure.
 
-Observation (31 values, float32):
+Observation (51 values, float32):
 
     ======  ===============================  ===================================
     Index   Field                            Source
     ======  ===============================  ===================================
-    0-19    4 boxes: cx, cy, w, h, visible   Detector, newest first, 0.1 s apart
+    0-39    8 boxes: cx, cy, w, h, visible   Detector, newest first, 0.1 s apart
     20-21   roll, pitch (rad)                IMU
     22-24   body rates (rad/s)               IMU
     25-28   previous action                  Policy, after the action filter
@@ -49,12 +49,13 @@ from envs.base_drone_env import (
     BaseDroneEnv,
     DroneState,
     _euler_to_quaternion,
+    _norm,
     _quaternion_to_euler,
     _world_to_body,
 )
 
 BOX_DIM = 5
-BOX_LAGS = (0, 5, 10, 15)  # Control steps back from now.
+BOX_LAGS = (0, 5, 10, 15, 20, 25, 30, 35)  # Control steps back from now.
 BOX_OBS_DIM = BOX_DIM * len(BOX_LAGS)
 OBS_ATTITUDE = BOX_OBS_DIM
 OBS_RATES = OBS_ATTITUDE + 2
@@ -141,7 +142,7 @@ class MarkerHoldEnv(BaseDroneEnv):
 
     def _in_camera_view(self, offset: np.ndarray) -> bool:
         task = self.config.marker_task
-        depth, right, down = self._to_camera(offset)
+        depth, right, down = self._to_camera(offset.tolist())
         return bool(
             depth > 0.0
             and abs(right) < depth * math.tan(task.horizontal_fov_rad / 2.0)
@@ -199,7 +200,7 @@ class MarkerHoldEnv(BaseDroneEnv):
             return box
 
         rng = self.np_random
-        if rng.random() < cfg.vision_false_positive_prob:
+        if rng.random() < cfg.vision_false_positive_prob * self.difficulty:
             size = rng.uniform(0.03, 0.3, 2)
             return np.array([*rng.uniform(-1.0, 1.0, 2), *size])
         if not box.any():
@@ -207,11 +208,11 @@ class MarkerHoldEnv(BaseDroneEnv):
 
         min_width = 2.0 * task.min_box_px / task.image_width_px
         fade = (box[2] - min_width) / min_width
-        blur = float(np.linalg.norm(state.angular_velocity)) / cfg.vision_blur_rate_rps
+        blur = _norm(state.angular_velocity) / cfg.vision_blur_rate_rps
         detect_prob = (
             (1.0 - cfg.vision_dropout_prob) * min(fade + 0.3, 1.0) * math.exp(-blur * blur)
         )
-        if rng.random() >= detect_prob:
+        if rng.random() >= 1.0 - self.difficulty * (1.0 - detect_prob):
             return np.zeros(4)
 
         pixel = 2.0 / task.image_width_px
@@ -231,7 +232,7 @@ class MarkerHoldEnv(BaseDroneEnv):
     def _ring_point(self, position: np.ndarray) -> np.ndarray:
         """Return the nearest point at the hold range and height."""
         away = position[:2] - self._marker[:2]
-        distance = float(np.linalg.norm(away))
+        distance = _norm(away)
         direction = away / distance if distance > 1e-6 else np.array([1.0, 0.0])
         return np.array([*(self._marker[:2] + self._hold_range * direction), -self._hold_height])
 
@@ -250,8 +251,8 @@ class MarkerHoldEnv(BaseDroneEnv):
         task = self.config.marker_task
         self._waypoint = self._ring_point(state.position)
         holding = (
-            np.linalg.norm(self._waypoint - state.position) < task.hold_radius_m
-            and np.linalg.norm(state.velocity) < self.config.waypoints.arrival_speed_mps
+            _norm(self._waypoint - state.position) < task.hold_radius_m
+            and _norm(state.velocity) < self.config.waypoints.arrival_speed_mps
         )
         self._hold_steps = self._hold_steps + 1 if holding else 0
         if self._hold_steps < round(self.config.waypoints.hold_s / self.dt):

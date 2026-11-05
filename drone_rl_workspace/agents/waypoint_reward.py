@@ -8,12 +8,14 @@ than loitering just outside the arrival gate.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from envs import DroneState
+from envs.base_drone_env import _norm
 
 PROXIMITY_RADIUS_M = 0.7
 PROXIMITY_SPEED_MPS = 1.0
@@ -39,19 +41,21 @@ def waypoint_reward(
     info: dict[str, Any],
 ) -> float:
     waypoint = info["waypoint"]
-    before = float(np.linalg.norm(waypoint - state.position))
-    after = float(np.linalg.norm(waypoint - next_state.position))
-    speed = float(np.linalg.norm(next_state.velocity))
+    # Against the waypoint as it stood. A hold point follows the vehicle, so measuring
+    # from where it moved to would pay for sliding around the marker as progress.
+    before = _norm(info["prev_waypoint"] - state.position)
+    after = _norm(waypoint - next_state.position)
+    speed = _norm(next_state.velocity)
 
-    proximity = np.exp(
+    proximity = math.exp(
         -((after / PROXIMITY_RADIUS_M) ** 2) - (speed / PROXIMITY_SPEED_MPS) ** 2
     )
     jerk = float(np.sum((action - info["prev_action"]) ** 2))
-    rate = float(np.linalg.norm(next_state.angular_velocity))
+    rate = _norm(next_state.angular_velocity)
 
     return (
         weights.progress * (before - after)
-        + weights.proximity * float(proximity)
+        + weights.proximity * proximity
         + (weights.arrival if info["arrived"] else 0.0)
         - weights.smoothness * jerk
         - weights.tilt * next_state.tilt

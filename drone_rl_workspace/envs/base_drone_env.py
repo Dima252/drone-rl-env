@@ -64,7 +64,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, SupportsFloat
@@ -118,8 +118,8 @@ class DroneState:
     @property
     def tilt(self) -> float:
         """Angle between body z and world z in radians, 0 when level."""
-        _, x, y, _ = self.quaternion
-        return float(np.arccos(np.clip(1.0 - 2.0 * (x * x + y * y), -1.0, 1.0)))
+        _, x, y, _ = self.quaternion.tolist()
+        return math.acos(min(max(1.0 - 2.0 * (x * x + y * y), -1.0), 1.0))
 
 
 # (state, action, next_state, info) -> reward. Reward is computed from ground
@@ -267,7 +267,7 @@ class MarkerTaskConfig:
     image_width_px: int = 640
 
     # Detector.
-    marker_size_m: float = 1.0  # Diameter of a round marker.
+    marker_size_m: float = 2.0  # Diameter of a round marker.
     min_box_px: float = 8.0
     box_std_px: float = 2.0
     lost_timeout_s: float = 0.5
@@ -277,7 +277,7 @@ class MarkerTaskConfig:
     hold_range_m: tuple[float, float] = (6.0, 14.0)
     hold_height_m: tuple[float, float] = (3.0, 8.0)
     hold_depression_spread_rad: float = 0.1
-    hold_radius_m: float = 0.75
+    hold_radius_m: float = 1.0
     new_hold_prob: float = 0.3
 
     # Start of an episode.
@@ -360,6 +360,24 @@ class DroneEnvConfig:
     marker_task: MarkerTaskConfig = field(default_factory=MarkerTaskConfig)
 
 
+# The environment steps millions of times, on vectors of three or four values, where
+# general NumPy routines cost far more than the arithmetic. The helpers below, and
+# the plain floats in the flight controller, return exactly what those routines do.
+
+
+def _norm(vector: np.ndarray) -> float:
+    """Return the length of a vector, as np.linalg.norm does but faster."""
+    return math.sqrt(vector.dot(vector))
+
+
+def _fields_to_dict(item: Any) -> dict[str, Any]:
+    """Copy a flat dataclass to a dict, as dataclasses.asdict does but faster."""
+    return {
+        name: value.copy() if isinstance(value, np.ndarray) else value
+        for name, value in vars(item).items()
+    }
+
+
 def _quaternion_to_euler(quaternion: np.ndarray) -> tuple[float, float, float]:
     """Return roll, pitch and yaw in radians (aerospace ZYX order)."""
     w, x, y, z = quaternion
@@ -385,8 +403,8 @@ def _euler_to_quaternion(roll: float, pitch: float, yaw: float) -> np.ndarray:
 
 
 def _quaternion_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    aw, ax, ay, az = a
-    bw, bx, by, bz = b
+    aw, ax, ay, az = a.tolist()
+    bw, bx, by, bz = b.tolist()
     return np.array(
         [
             aw * bw - ax * bx - ay * by - az * bz,
@@ -409,8 +427,19 @@ def _blend_domains(easy: DomainParams, hard: DomainParams, amount: float) -> Dom
 
 def _world_to_body(quaternion: np.ndarray, vector: np.ndarray) -> np.ndarray:
     """Rotate a world-frame vector into the body frame."""
-    w, u = quaternion[0], -quaternion[1:]
-    return vector + 2.0 * (w * np.cross(u, vector) + np.cross(u, np.cross(u, vector)))
+    w, x, y, z = quaternion.tolist()
+    x, y, z = -x, -y, -z
+    a, b, c = vector.tolist()
+    # Two cross products: first u x v, then u x (u x v).
+    p, q, r = y * c - z * b, z * a - x * c, x * b - y * a
+    s, t, u = y * r - z * q, z * p - x * r, x * q - y * p
+    return np.array(
+        [
+            a + 2.0 * (w * p + s),
+            b + 2.0 * (w * q + t),
+            c + 2.0 * (w * r + u),
+        ]
+    )
 
 
 class DelayLine:
@@ -435,8 +464,9 @@ class DelayLine:
         self._history.append(value)
         self._held_age += 1
         dropped = rng.random() < self._drop_prob
-        age = self._delay + int(rng.integers(-self._jitter, self._jitter + 1))
-        age = max(age, 0)
+        age = self._delay
+        if self._jitter:
+            age = max(age + int(rng.integers(-self._jitter, self._jitter + 1)), 0)
         if not dropped and age < self._held_age:
             self._held = self._history[-1 - age]
             self._held_age = age
@@ -448,9 +478,10 @@ class BaseDroneEnv(gym.Env):
 
     Args:
         reward_func: Called as ``reward_func(state, action, next_state, info)``
-            after every step. ``info`` holds ``prev_action``, ``terminated``,
-            ``truncated`` and ``arrived`` in addition to the keys returned from
-            ``step``. Its ``waypoint`` is the one this step was flown towards.
+            after every step. ``info`` holds ``prev_action``, ``prev_waypoint``,
+            ``terminated``, ``truncated`` and ``arrived`` in addition to the keys
+            returned from ``step``. Its ``waypoint`` is the one this step was flown
+            towards, and ``prev_waypoint`` is where that stood before the step.
         config: Shared environment settings. Defaults to ``DroneEnvConfig()``.
         render_mode: ``None``, or ``"rgb_array"`` for a camera following the drone.
     """
@@ -535,6 +566,8 @@ class BaseDroneEnv(gym.Env):
         self._nominal_motor_lag = model.actuator_dynprm[:, 0].copy()
         self._gravity = float(model.opt.gravity[2])
         self._max_motor_thrust = float(model.actuator_ctrlrange[0, 1])
+        self._physics_dt = float(model.opt.timestep)
+        self._inertia_values = self._nominal_inertia.tolist()
         self._gyro = self._data.sensor("gyro")
         self._accelerometer = self._data.sensor("accelerometer")
 
@@ -546,7 +579,7 @@ class BaseDroneEnv(gym.Env):
         self._mixer = np.linalg.inv(np.vstack([-gears[:, 2], torques.T]))
 
         self._velocity_integral = np.zeros(3)
-        self._rate_integral = np.zeros(3)
+        self._rate_integral = [0.0, 0.0, 0.0]
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -594,7 +627,7 @@ class BaseDroneEnv(gym.Env):
         return self._make_observation(sensors), self._make_info(self._state)
 
     def set_difficulty(self, difficulty: float) -> None:
-        """Scale randomization from the nominal vehicle (0) to the full range (1).
+        """Scale randomization and sensor errors from none (0) to the full range (1).
 
         Takes effect from the next reset. Training ramps this up, and evaluation
         always runs at 1.
@@ -637,12 +670,14 @@ class BaseDroneEnv(gym.Env):
         termination = self._termination_reason(next_state)
         terminated = bool(termination)
         truncated = self._step_count >= self.config.max_episode_steps
+        previous_waypoint = self._waypoint.copy()
         arrived = not terminated and self._update_hold(next_state)
 
         info = self._make_info(next_state, termination)
         reward_info = {
             **info,
             "prev_action": self._last_action,
+            "prev_waypoint": previous_waypoint,
             "terminated": terminated,
             "truncated": truncated,
             "arrived": arrived,
@@ -717,7 +752,7 @@ class BaseDroneEnv(gym.Env):
         # Start in flight with the motors already spinning at nominal hover.
         data.act[:] = self._nominal_mass * self._gravity / 4.0
         self._velocity_integral = np.zeros(3)
-        self._rate_integral = np.zeros(3)
+        self._rate_integral = [0.0, 0.0, 0.0]
 
         self._gust = rng.normal(0.0, domain.gust_std_mps, 3)
         self._apply_wind()
@@ -737,17 +772,18 @@ class BaseDroneEnv(gym.Env):
 
         if self.config.control_mode is ControlMode.VELOCITY:
             roll, pitch, thrust = self._velocity_to_attitude(command[:3], dt)
-            yaw_rate = command[3]
+            yaw_rate = float(command[3])
         else:
-            roll, pitch, yaw_rate = command[:3]
+            roll, pitch, yaw_rate, throttle = command.tolist()
             weight = self._nominal_mass * self._gravity
-            thrust = command[3] * weight / self.domain.hover_thrust
+            thrust = throttle * weight / self.domain.hover_thrust
 
         self._update_gust(dt)
         self._update_push()
         self._update_thrust_loss()
+        ctrl = data.ctrl
         for _ in range(self._substeps):
-            data.ctrl[:] = self._attitude_to_motors(roll, pitch, yaw_rate, thrust)
+            ctrl[:] = self._attitude_to_motors(roll, pitch, yaw_rate, thrust)
             mujoco.mj_step(model, data)
 
         # mj_step leaves sensors one substep behind the integrated state.
@@ -818,7 +854,7 @@ class BaseDroneEnv(gym.Env):
         directly below can leave the frame during hard manoeuvres.
         """
         cfg = self.config.camera
-        if not cfg.enabled or np.linalg.norm(offset) > cfg.max_range_m:
+        if not cfg.enabled or _norm(offset) > cfg.max_range_m:
             return False
         tilt = cfg.mount_tilt_rad + self.domain.camera_tilt_error_rad
         depth = math.sin(tilt) * offset[0] + math.cos(tilt) * offset[2]
@@ -868,48 +904,49 @@ class BaseDroneEnv(gym.Env):
         # Divide by the tilt so the vertical component of thrust stays correct.
         tilt_factor = max(math.cos(roll) * math.cos(pitch), 0.5)
         thrust = self._nominal_mass * (self._gravity - accel_down) / tilt_factor
-        return roll_cmd, pitch_cmd, thrust
+        return roll_cmd, pitch_cmd, float(thrust)
 
     def _attitude_to_motors(
         self, roll_cmd: float, pitch_cmd: float, yaw_rate_cmd: float, thrust: float
-    ) -> np.ndarray:
+    ) -> list[float]:
         """Attitude P and rate PI loops, then the mixer: return motor thrusts."""
         gains = self.config.controller
         data = self._data
 
-        roll, pitch, _ = _quaternion_to_euler(data.qpos[3:7])
+        roll, pitch, _ = _quaternion_to_euler(data.qpos[3:7].tolist())
         attitude_p = gains.attitude_p * self.domain.attitude_gain_scale
-        rate_cmd = np.array(
-            [
-                attitude_p * (roll_cmd - roll),
-                attitude_p * (pitch_cmd - pitch),
-                yaw_rate_cmd,
-            ]
+        rate_x, rate_y, rate_z = data.qvel[3:6].tolist()
+        rate_error = (
+            attitude_p * (roll_cmd - roll) - rate_x,
+            attitude_p * (pitch_cmd - pitch) - rate_y,
+            yaw_rate_cmd - rate_z,
         )
-        rate_error = rate_cmd - data.qvel[3:6]
-        self._rate_integral = np.clip(
-            self._rate_integral
-            + gains.rate_i * rate_error * self._model.opt.timestep,
-            -gains.max_rate_integral,
-            gains.max_rate_integral,
-        )
+        limit = gains.max_rate_integral
+        integral = [
+            min(max(held + gains.rate_i * error * self._physics_dt, -limit), limit)
+            for held, error in zip(self._rate_integral, rate_error)
+        ]
+        self._rate_integral = integral
 
-        torque = self._nominal_inertia * (
-            np.array(gains.rate_p) * rate_error + self._rate_integral
-        )
+        torque = [
+            inertia * (gain * error + held)
+            for inertia, gain, error, held in zip(
+                self._inertia_values, gains.rate_p, rate_error, integral
+            )
+        ]
         # Yaw authority is weak, so an unlimited demand would saturate the motors
         # and take away the roll and pitch control that keeps the vehicle upright.
-        torque[2] = np.clip(
-            torque[2], -gains.max_yaw_torque_nm, gains.max_yaw_torque_nm
-        )
-        motors = self._mixer @ np.array([thrust, *torque])
+        yaw_limit = gains.max_yaw_torque_nm
+        torque[2] = min(max(torque[2], -yaw_limit), yaw_limit)
+        motors = (self._mixer @ np.array([thrust, *torque])).tolist()
 
         # Attitude takes priority over thrust, as in ArduPilot: shift all motors
         # together to stay in range, because clipping them one by one would
         # remove the thrust differences that hold attitude.
-        motors += max(-motors.min(), 0.0)
-        motors -= max(motors.max() - self._max_motor_thrust, 0.0)
-        return motors
+        raise_by = max(-min(motors), 0.0)
+        motors = [motor + raise_by for motor in motors]
+        lower_by = max(max(motors) - self._max_motor_thrust, 0.0)
+        return [motor - lower_by for motor in motors]
 
     # ------------------------------------------------------------------
     # Domain randomization (reset)
@@ -970,7 +1007,7 @@ class BaseDroneEnv(gym.Env):
             link_jitter_steps=self._sample_delay(cfg.link_jitter_steps),
             link_drop_prob=float(rng.uniform(*cfg.link_drop_prob)),
         )
-        return _blend_domains(DomainParams(), full, self.difficulty)
+        return _blend_domains(DomainParams(noise_scale=0.0), full, self.difficulty)
 
     def _sample_delay(self, delay_range: tuple[int, int]) -> int:
         low, high = delay_range
@@ -1037,9 +1074,10 @@ class BaseDroneEnv(gym.Env):
         rng = self.np_random
         scale = self.domain.noise_scale
         self._gyro_bias = self._gyro_bias + rng.normal(
-            0.0, cfg.gyro_bias_walk_rps * math.sqrt(self.dt), size=3
+            0.0, cfg.gyro_bias_walk_rps * self.difficulty * math.sqrt(self.dt), size=3
         )
-        throttle = float(self._data.act.mean()) / self._max_motor_thrust
+        motors = self._data.act.tolist()
+        throttle = sum(motors) / len(motors) / self._max_motor_thrust
         gyro_std = scale * (cfg.gyro_std_rps + cfg.gyro_vibration_std_rps * throttle)
         gyro = (
             state.angular_velocity
@@ -1050,7 +1088,7 @@ class BaseDroneEnv(gym.Env):
             self._heading_error, _quaternion_multiply(state.quaternion, self._trim_error)
         )
         quaternion = quaternion + rng.normal(0.0, cfg.attitude_std * scale, size=4)
-        return quaternion / np.linalg.norm(quaternion), gyro
+        return quaternion / _norm(quaternion), gyro
 
     def _read_gps(self, state: DroneState) -> tuple[np.ndarray, np.ndarray]:
         """Return position and velocity as the autopilot's EKF reports them.
@@ -1116,7 +1154,7 @@ class BaseDroneEnv(gym.Env):
         rng = self.np_random
         scale = self.domain.noise_scale
 
-        if camera.enabled and rng.random() < cfg.vision_false_positive_prob:
+        if camera.enabled and rng.random() < cfg.vision_false_positive_prob * self.difficulty:
             # Something else on the ground looks like the marker.
             half_width = math.tan(camera.horizontal_fov_rad / 2.0)
             half_height = math.tan(camera.vertical_fov_rad / 2.0)
@@ -1128,14 +1166,14 @@ class BaseDroneEnv(gym.Env):
         if not state.target_visible:
             return np.zeros(3), False
 
-        distance = float(np.linalg.norm(state.target_offset))
+        distance = _norm(state.target_offset)
         fade_start = camera.fade_start * camera.max_range_m
         fade = (camera.max_range_m - distance) / (camera.max_range_m - fade_start)
-        blur = float(np.linalg.norm(state.angular_velocity)) / cfg.vision_blur_rate_rps
+        blur = _norm(state.angular_velocity) / cfg.vision_blur_rate_rps
         detect_prob = (
             (1.0 - cfg.vision_dropout_prob) * min(fade, 1.0) * math.exp(-blur * blur)
         )
-        if rng.random() >= detect_prob:
+        if rng.random() >= 1.0 - self.difficulty * (1.0 - detect_prob):
             return np.zeros(3), False
 
         direction = state.target_offset / max(distance, 1e-6)
@@ -1190,8 +1228,8 @@ class BaseDroneEnv(gym.Env):
         cfg = self.config.waypoints
         estimate = state.position + self._gps_position_error + self._gps_glitch
         holding = (
-            np.linalg.norm(self._waypoint - estimate) < cfg.arrival_radius_m
-            and np.linalg.norm(state.velocity) < cfg.arrival_speed_mps
+            _norm(self._waypoint - estimate) < cfg.arrival_radius_m
+            and _norm(state.velocity) < cfg.arrival_speed_mps
         )
         self._hold_steps = self._hold_steps + 1 if holding else 0
         if self._hold_steps < round(cfg.hold_s / self.dt):
@@ -1236,9 +1274,9 @@ class BaseDroneEnv(gym.Env):
         cfg = self.config
         if state.altitude < cfg.min_altitude_m:
             return "altitude"
-        if np.any(np.abs(state.position) > cfg.max_position_m):
+        if max(map(abs, state.position.tolist())) > cfg.max_position_m:
             return "geofence"
-        if np.linalg.norm(state.velocity) > cfg.max_speed_mps:
+        if _norm(state.velocity) > cfg.max_speed_mps:
             return "speed"
         if state.tilt > cfg.max_tilt_rad:
             return "tilt"
@@ -1278,8 +1316,8 @@ class BaseDroneEnv(gym.Env):
     def _make_info(self, state: DroneState, termination: str = "") -> dict[str, Any]:
         """Privileged data for logging and asymmetric critics, not for the actor."""
         return {
-            "true_state": asdict(state),
-            "domain": asdict(self.domain),
+            "true_state": _fields_to_dict(state),
+            "domain": _fields_to_dict(self.domain),
             "step": self._step_count,
             "waypoint": self._waypoint.copy(),
             "waypoints_reached": self._waypoints_reached,

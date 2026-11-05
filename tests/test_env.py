@@ -678,6 +678,30 @@ def test_difficulty_zero_is_the_nominal_vehicle():
     assert env.domain.push_force_n == 0.0
 
 
+def test_difficulty_zero_has_clean_sensors():
+    env = BaseDroneEnv(scout_reward, make_config())
+    env.set_difficulty(0.0)
+    env.reset(seed=1)
+    assert env.domain.noise_scale == 0.0
+    state = env._state
+    position, velocity = env._read_gps(state)
+    quaternion, gyro = env._read_imu(state)
+    assert position == pytest.approx(state.position)
+    assert velocity == pytest.approx(state.velocity)
+    assert quaternion == pytest.approx(state.quaternion)
+    assert gyro == pytest.approx(state.angular_velocity)
+
+
+def test_full_difficulty_keeps_the_full_noise_range():
+    env = BaseDroneEnv(scout_reward, make_config())
+    scales = []
+    for seed in range(50):
+        env.reset(seed=seed)
+        scales.append(env.domain.noise_scale)
+    low, high = make_config().randomization.noise_scale
+    assert low <= min(scales) < 0.7 and 1.8 < max(scales) <= high
+
+
 def test_difficulty_scales_every_parameter_between_the_ends():
     easy = DomainParams()
     hard = DomainParams(
@@ -884,6 +908,7 @@ def info_for(waypoint, **overrides) -> dict:
     return {
         "waypoint": np.array(waypoint, dtype=float),
         "prev_action": np.zeros(4),
+        "prev_waypoint": np.array(waypoint, dtype=float),
         "terminated": False,
         "arrived": False,
         **overrides,
