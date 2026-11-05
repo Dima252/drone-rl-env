@@ -1,9 +1,9 @@
 # Training plan and open decisions
 
 Status on 2026-11-05. The decisions below are in the code, and the user left training
-to the assistant's judgment. **One lab model has passed, narrowly: `runs/scout/lab-pass`.
-The realistic stage has not started**, because the user chose to review the lab result
-first, and because of the open problem below.
+to the assistant's judgment. **The best lab model is `runs/scout/lab-best`: 99% holds and
+0.8% crashes on 800 flights. The realistic stage has not started**, because the user
+chose to review the lab result first.
 
 ## Lab results so far
 
@@ -25,7 +25,8 @@ from 200 flights, except `lab-check` with 100.
 
 - **`lab` failed because the rate stayed high for too long.** The policy change per
   update reached a KL over 0.1, half of all updates were clipped, the action std
-  collapsed from 0.37 to 0.04, and the commands became jerky. The default is now 1e-4.
+  collapsed from 0.37 to 0.04, and the commands became jerky. With the small batch of
+  the time, 1e-4 was better. The larger batch below made 3e-4 safe.
 - **The later runs failed by circling the marker, because the reward paid for it.**
   Failed flights drifted sideways in one direction. `step()` moved the hold point to
   the vehicle's new position, then the reward measured progress from the old position
@@ -37,27 +38,56 @@ from 200 flights, except `lab-check` with 100.
 - **`best_model` was misjudged by 20 flights.** One scored 90% in training and 74% on
   200 flights. It now uses 64.
 
-## Open problem: training gets worse after its peak
+## Sweeps: what made training work
 
-Both the pass and the fix are fragile:
+Each run is scored on 200 flights. Seeds are in the run names.
 
-- `lab-fix-s0` peaked between 1M and 3M steps, then fell from about 600 reward to about
-  100, and sideways drift came back at 1.3 to 2.4 m/s. The reward falls, so this is not
-  an exploit.
-- `lab-fix-s1` never passed, so only one of two seeds did, and only at a checkpoint.
-- The model at the bar is one result: 90% over 200 flights is about +/-4%.
-- `best_model` is picked by reward, and picked a 72% model over the 90% one.
+| Change | Steps | Final model | Result |
+|---|---|---|---|
+| Batch 2048, 5 epochs, 3e-4, lambda 0.95 | 6M | 25% and 18% holds | No better alone |
+| Same, lambda 0.98 | 6M | 92% and 98% holds | The breakthrough |
+| Same, lambda 0.98 | 12M | 97% and 20% holds | One seed collapsed |
+| Same, lambda 0.99 | 12M | 94 to 100% holds | Six of six held up, in three variants |
+| Same, lambda 0.995 | 12M | 95% and 98% holds | More crashes, 5.0% on one seed |
+| Lambda 0.98, batch 256, 1e-4 | 12M | 47% and 65% holds | Declined |
+| Crash penalty 300, lambda 0.99 | 12M | 96% and 98% holds | No help, 2.5 to 4.5% crashes |
+| Lambda 0.99, no entropy bonus | 24M | 96% and 32% holds | One of two collapsed |
+| Same, reward with no flat region | 24M | 96, 96, 48, 52% holds | Two of four declined |
+| Same, entropy bonus 0.001 | 24M | 98% and 30% holds | One of two collapsed |
+| **Same, entropy bonus 0.003** | 24M | **96% and 98% holds** | **Two of two held, 30 holds a minute** |
 
-The likely cause is falling exploration. There is no entropy bonus, so the action std
-falls from 0.37 to about 0.05. As it falls, the same weight change moves the policy
-further: the decline starts near a std of 0.15, as KL and clipping rise. This is a
-correlation, and has not been tested.
+Why these work:
 
-A 20M realistic run on these settings would probably decline the same way. Before it:
+- **Lambda.** At 0.95 an action gets credit for about 0.35 s. Stopping sideways drift pays
+  off 1 to 2 s later, so the policy could not learn it.
+- **Entropy bonus.** Lambda alone delays the decline. It starts as steady sideways drift,
+  usually long before scores fall: in one run it grew from 0.07 to 0.86 m/s, while
+  healthy runs stay near 0.1. Another run was healthy at 18M and collapsed by 24M. The
+  policy ends up circling on the ring at about 1.7 m/s, too fast to count a hold, and can
+  circle both ways, so it has lost its correction rather than gained a bias.
+  - The likely cause is falling action noise: with little noise the vehicle is rarely
+    knocked sideways, and the signal to correct it fades. At 10 m a 0.2 m/s drift is only
+    about 0.02 rad/s of yaw rate. At 0.003 the std stays above 0.22.
+  - This rests on two runs and a likely cause, not proof. Four of the eight 24M runs
+    without enough bonus declined, against none of two with it.
+- **A collapsed policy does not recover.** Continuing one for 3M steps failed under the
+  current reward and two others, so a reward with no flat region is not the fix.
 
-1. Add `--ent-coef`, and test whether a small entropy bonus holds the std and stops the
-   decline. `GraphedPPO` already supports `ent_coef`.
-2. Pick `best_model` by holds completed, not by reward.
+`best_model` is still picked by reward. At these settings it kept a 98 to 100% checkpoint
+from three of the four collapsed 24M runs, and an 89% one from the other.
+
+## Open problem: crashes at the start of a flight
+
+Nearly every failure is now a crash in the first few seconds, from an awkward start:
+
+- **Far and low**, 15 to 22 m out and 3 to 5 m up: the marker sits high in the frame, and
+  a nose-down dash pushes it out of the top. Pitching forward about 0.26 rad is enough.
+- **Close and high**: the marker sits low in the frame, and the vehicle drops too fast.
+
+Crash rates over 800 flights differ by seed: 0.8 to 3.75%. The two entropy models crash
+on 3.75% and 2.25%, so the stable settings do not yet meet the 2% bar on their own, and
+`lab-best` came from a run without the bonus. The start positions are unchanged on
+purpose: narrowing them would hide this.
 
 ## Decisions
 

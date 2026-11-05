@@ -66,7 +66,15 @@ GAMMA = 0.995
 # Experience per update. n_steps follows from n_envs, so adding environments does
 # not change how much PPO sees between updates.
 ROLLOUT_SIZE = 16_384
-BATCH_SIZE = 256
+BATCH_SIZE = 2048
+
+# How far ahead an action gets credit. Stopping sideways drift pays off 1 to 2 seconds
+# later, and at 0.95 credit fades in about 0.35 s: runs learned the hold, then lost it.
+GAE_LAMBDA = 0.99
+
+# Keeps action noise up. Below a std of about 0.15 the vehicle is rarely knocked
+# sideways, the policy stops correcting sideways drift, and it ends up circling.
+ENT_COEF = 0.003
 
 # Randomization rises only once the policy does the job at the current level. A
 # timed ramp outruns learning: difficulty reached 0.5 with no waypoints completed.
@@ -251,7 +259,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-freq", type=int, default=250_000)
     parser.add_argument("--n-eval-episodes", type=int, default=64)
     parser.add_argument("--checkpoint-freq", type=int, default=500_000)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", default=time.strftime("%Y%m%d-%H%M%S"))
     parser.add_argument(
@@ -355,11 +363,11 @@ def train(agent: str, reward_func: RewardFunc) -> None:
             learning_rate=linear_schedule(args.learning_rate),
             n_steps=args.n_steps,
             batch_size=BATCH_SIZE,
-            n_epochs=10,
+            n_epochs=5,
             gamma=GAMMA,
-            gae_lambda=0.95,
+            gae_lambda=GAE_LAMBDA,
             clip_range=0.2,
-            ent_coef=0.0,
+            ent_coef=ENT_COEF,
             # A starting std of about 0.37 keeps early actions from saturating at
             # the +/-1 limits.
             policy_kwargs={
