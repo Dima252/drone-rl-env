@@ -1,11 +1,15 @@
 # Training plan and open decisions
 
-Status on 2026-11-05. The decisions below are in the code, and the user left training
+Status on 2026-11-06. The decisions below are in the code, and the user left training
 to the assistant's judgment. **The best lab model is `runs/scout/baro-lab`, with the
-barometer: 100% holds and no crashes on 800 flights. The realistic stage has not met its
-bar**: on 400 randomized flights, `runs/scout/x500-e10-s0` scores highest, with 86% holds
-and 5.8% crashes, but its commands chatter. `runs/scout/x500-smooth-s1` is the best smooth
-model, with 78% and 7.5%. See "Entropy and climb rate on the reference build" below.
+barometer: 100% holds and no crashes on 800 flights. The best realistic model is
+`runs/scout/slow-s1`, which passes nominal and randomized but not the whole bar**: on 800
+randomized flights it holds on 85.5% and crashes on 2.0%, exactly at the limit. It is the
+only one of four seeds to pass those two. Worst case (about 41% crashes) and unseen (about
+66%) still fail, mostly from altitude. Climb rate roughly halves those two, and
+`runs/scout/climbslow-s3` matches `slow-s1` on randomized, but it has not been re-scored on
+fresh flights and the node cannot fly it yet. No model meets the whole bar. See "Slower
+approach: results" and "Climb rate with the slower approach" below.
 
 ## Lab results so far
 
@@ -297,23 +301,136 @@ That is about where 0.003 landed, and s0 chatters anyway, so entropy alone does 
 the gain from the chatter. The smoothness penalty is small: at 0.05 it costs chatter about 20
 points of a 450 point flight.
 
-`x500-smooth` started from `x500-e10-s0` for 16M steps, with the penalty at 0.5, selected by
-`DRONE_SMOOTHNESS=0.5`, and a bonus of 0.003. On 400 flights per scenario:
+`x500-smooth` started from `x500-e10-s0` for 16M steps, with the penalty at 0.5 and a bonus
+of 0.003. On 400 flights per scenario:
 
 | Run | Level | Action noise | Randomized holds | Randomized crashes | Worst case crashes | Unseen crashes | Output change |
 |---|---|---|---|---|---|---|---|
 | `x500-smooth-s0` | 0.80 | 0.29 | 66% | 16.5% | 66% | 80% | 0.21 |
 | `x500-smooth-s1` | 0.85 | 0.30 | 78% | 7.5% | 86% | 83% | 0.30 |
 
-- **The penalty works on chatter.** Nominal output change fell by about 4 to 6 times, and the
-  share of time at a limit fell from up to 54% to 5% or less. Direction reversals stay near
-  90%, but they are now small, and `baro-lab` shows the same at 0.04.
+- **The penalty works on chatter in clean conditions, much less under randomization.**
+  Nominal output change fell by about 4 to 6 times, and the share of time at a limit fell
+  from up to 54% to 5% or less. Direction reversals stay near 90%, but they are now small,
+  and `baro-lab` shows the same at 0.04. On randomized flights the change only fell from
+  1.27 to 0.81 to 0.86, which is where the low-entropy models sit too, and yaw still spends
+  38 to 51% of the time at its limit.
 - **It costs some of the skill, and how much depends on the seed.** s1 is close to
   `x500-e10-s1`, while s0 lost 20 points of holds and tripled its crashes. Both started from
   the same model, so this is seed spread, and a single run proves little.
 - **Worst case did not improve.** It rose to 86% for s1.
 - **`x500-smooth-s1` is the best model that does not chatter**, and no model meets the bar.
   Losing the marker is its main crash cause on randomized flights, 25 of 30 crashes.
+
+## Why the marker is lost, and whether worst case can be flown
+
+`x500-smooth-s1` on the 400 randomized evaluation flights:
+
+- **All 25 marker-lost crashes come in the first 7 seconds, before any hold.** The vehicle is
+  usually 3 to 8 m from the marker, often well inside its hold range, and moving at 2 to 5 m/s.
+- **The marker leaves by the bottom of the frame in 14 of 25**, by a side in 7, and in 4 it
+  stays in frame while detections stop. Coming in fast, then braking nose-up, drops it out
+  of a fixed camera. Backing away needs the same nose-up attitude.
+- **Wind, noise, delay and faults look about the same in lost and safe flights**, so this is
+  how the policy flies rather than one bad condition.
+
+A hold pays 50 points and can repeat, so time is worth roughly 0.37 points a step, and nothing
+priced speed. A plain controller given the true state shows what speed costs. It flies the
+same physics, delays and action filter, and is ended by the same marker rules. On 400 flights:
+
+| Speed limit | Nominal crashes | Randomized holds | Randomized crashes | Worst case holds | Worst case crashes |
+|---|---|---|---|---|---|
+| 0.75 m/s | 2.5% | 94% | 4.0% | 86% | 7.2% |
+| 1.0 m/s | 2.5% | 96% | 4.5% | 92% | 8.8% |
+| 1.5 m/s | 3.2% | 92% | 8.0% | 88% | 14.0% |
+| 2.0 m/s | 7.2% | 88% | 12.0% | 82% | 22.2% |
+
+- **Worst case can be flown, so its bar stays.** At 1 m/s the controller is inside the 10%
+  limit, where the policy crashes on 86%. It has perfect state and no camera noise, so this
+  is an upper bound, but the gap is the policy's and not the physics'. Unseen at 1.5 m/s was
+  12% crashes on 160 flights.
+- **Worst case is a corner of combined conditions.** Pinning one group at its hard end costs
+  `x500-smooth-s1` 4 to 14% crashes on 160 flights. Pinning all of them costs 86%. Training
+  almost never meets that combination.
+- **The controller's remaining crashes come early**, with a median about 1 second in, often
+  from starts with the marker low in the frame. `x500-smooth` crashes on 1% of nominal
+  flights, so these starts can be survived, and they stay as they are.
+- **Detector errors cause about 30% of randomized chatter.** Removing them takes output
+  change from 0.85 to 0.59.
+- **Training never reached full difficulty, though evaluation flies at 1.0.** The best level
+  was 0.90, and `x500-smooth-s1` sat at 0.80 for 13M steps under the gate of 5 holds.
+
+Changes that follow, all in the reward, the gate and the evaluator:
+
+- Ground speed over 1 m/s now costs 0.5 a step per m/s, just above the value of time.
+- The smoothness weight is 0.5, as the new default.
+- The curriculum gate is 4 holds a flight, because a slower approach leaves time for fewer.
+- The evaluator limits output change to 0.5 on nominal and 1.0 on randomized. The smooth
+  models pass; `x500-e10` at 1.20 and 1.27, and climb rate at 1.3 to 1.7 on nominal, fail.
+  Randomized has the higher limit because detector noise raises it for every model.
+
+## Slower approach: results
+
+`slow` started from `baro-lab` for 24M steps, with the reward, gate and limits above and an
+entropy bonus of 0.01. All four seeds reached level 1.0, the first runs to do so. Each cell
+gives 400 evaluation flights, then, for s0 and s1, 400 fresh flights that played no part in
+any choice.
+
+| Run | Nominal holds | Nominal crashes | Randomized holds | Randomized crashes | Worst case crashes | Unseen crashes | Output change, nominal and randomized |
+|---|---|---|---|---|---|---|---|
+| `slow-s0` | 95%, 96% | 0%, 0.2% | 79%, 82% | 3.0%, 4.0% | 56%, 56% | 69%, 69% | 0.05, 0.69 |
+| **`slow-s1`** | 100%, 98% | 0%, 0% | 88%, 83% | 2.0%, 2.0% | 41%, 42% | 65%, 66% | 0.24, 0.75 |
+| `slow-s2` | 100% | 0% | 80% | 3.2% | 77% | 76% | 0.07, 0.66 |
+| `slow-s3` | 86% | 5.2% | 75% | 7.5% | 56% | 76% | 0.05, 0.72 |
+
+- **Crashes fell for three seeds of four, with no chatter limit broken.** `x500-smooth-s1` had
+  7.5%, and `x500-e10-s0` 5.8% with chatter. Marker-lost crashes on those evaluation flights
+  fell from 25 to 4 for s1, and to 9 or 10 for the others.
+- **`slow-s1` passes nominal and randomized with no margin, and the method does not pass
+  reliably.** 16 crashes in 800 flights is exactly 2%. The other three seeds miss, at 3 to
+  7.5%, and s3 fails nominal too, with 21 altitude crashes. The mean over the seeds is 80.5%
+  holds and 3.9% crashes on the evaluation flights.
+- **Altitude is now the main failure in the two hardest scenarios.** It causes 116 to 125 of
+  about 165 worst case crashes for s1. Hovering at the corner needs about +0.3 on the thrust
+  output, where randomized flights need about 0. Over 160 flights the policy sinks at about
+  0.7 m/s and only raises thrust in the final second. 13 of 51 of those crashes came before
+  the motor fault. Climb rate moves that offset into the autopilot's loop.
+
+## Climb rate with the slower approach
+
+The earlier comparison was unfair because the climb lab models were weak. With the new
+reward both lab seeds pass: `climbslow-lab-s1` scored 100% holds and 0.2% crashes, and
+`climbslow-lab-s0` 99% and 1.2%, on 400 flights. `climbslow` started from `climbslow-lab-s1`
+with the same settings as `slow`, on four seeds. All reached level 1.0. On 400 flights per
+scenario:
+
+| Run | Nominal holds | Nominal crashes | Randomized holds | Randomized crashes | Worst case crashes | Unseen crashes | Output change, nominal and randomized |
+|---|---|---|---|---|---|---|---|
+| `climbslow-s0` | 97% | 0% | 76% | 4.2% | 22% | 56% | 0.04, 0.65 |
+| `climbslow-s1` | 96% | 0.2% | 76% | 3.8% | 13% | 44% | 0.04, 0.56 |
+| `climbslow-s2` | 99% | 0% | 82% | 2.8% | 25% | 52% | 0.04, 0.62 |
+| **`climbslow-s3`** | 93% | 0% | 81% | 2.0% | 29% | 53% | 0.03, 0.61 |
+| Mean of the four | 96% | 0.1% | 79% | 3.2% | 22% | 51% | |
+| Mean of the four `slow` seeds | 95% | 1.3% | 80.5% | 3.9% | 57% | 71% | |
+
+- **Climb rate clearly helps the hard scenarios.** Mean worst case crashes fell from 57% to
+  22%, and unseen from 71% to 51%, on every seed. `climbslow-s1` at 13% is close to the 10%
+  bar, though unseen is still far from 15%.
+- **It is level on randomized.** The means are within the spread between seeds. Holds are 79%
+  against 80.5%, and crashes 3.2% against 3.9%. Chatter is a little lower.
+- **`climbslow-s3` passes nominal and randomized on these flights, with no margin.** It is the
+  best of four on one set of flights and has not been re-scored on fresh ones.
+- **No seed passes everything.** The seed best on worst case is not the one best on
+  randomized.
+- **Altitude fell, and other causes now share the crashes.** In worst case, altitude is 3 to
+  63 crashes per seed, against 116 to 227 for `slow`. Leaving the geofence rose to 7 to 24.
+  Unseen altitude crashes are still 69 to 139.
+
+Climb rate is still a simulator-only mode: `DRONE_CONTROL_MODE=climb` is a temporary switch,
+and `ros2_inference_node.py` and `export_onnx.py` accept attitude models only. Adopting it
+means making it the default and changing both, as set out above. Next, in order: re-score
+`climbslow-s3` and `climbslow-s1` on fresh flights, adopt climb rate if that holds, then look
+at the geofence crashes and the remaining unseen altitude crashes.
 
 ## Latency
 
@@ -361,11 +478,12 @@ against one condition at a time, which needs no retraining.
 
 Evaluator gates, from `agents/evaluate.py`:
 
-| Scenario | Crashes at most | Completes a hold |
-| --- | --- | --- |
-| Nominal, randomized | 2% | At least 80% |
-| Worst case | 10% | Not gated |
-| Unseen conditions | 15% | Not gated |
+| Scenario | Crashes at most | Completes a hold | Output change at most |
+| --- | --- | --- | --- |
+| Nominal | 2% | At least 80% | 0.5 |
+| Randomized | 2% | At least 80% | 1.0 |
+| Worst case | 10% | Not gated | Not gated |
+| Unseen conditions | 15% | Not gated | Not gated |
 
 Crashes include losing the marker and coming too close. The lab pass bar is stricter
 than the nominal row above, and applies before the realistic stage.

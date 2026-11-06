@@ -83,7 +83,7 @@ ENT_COEF = 0.003
 # few holds to learn from, stalled there for 20M steps and forgot the lab task.
 CURRICULUM_STEP = 0.05
 CURRICULUM_MIN_EPISODES = 50
-CURRICULUM_MIN_WAYPOINTS = 5.0  # Mean per episode.
+CURRICULUM_MIN_WAYPOINTS = 4.0  # Mean per episode.
 CURRICULUM_MAX_CRASH_RATE = 0.05
 
 # Normalization statistics weigh new data against the samples behind them. After a

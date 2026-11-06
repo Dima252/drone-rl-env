@@ -718,9 +718,9 @@ def test_difficulty_scales_every_parameter_between_the_ends():
 @pytest.mark.parametrize(
     "waypoints, crashes, expected",
     [
-        ([5] * 50, [False] * 50, 0.55),  # Earned.
+        ([4] * 50, [False] * 50, 0.55),  # Earned.
         ([1] * 50, [False] * 50, 0.5),  # Survives, but barely does the job.
-        ([5] * 49, [False] * 49, 0.5),  # Too few episodes to judge.
+        ([4] * 49, [False] * 49, 0.5),  # Too few episodes to judge.
         ([6] * 50, [True] * 10 + [False] * 40, 0.5),  # Crashing too often.
     ],
 )

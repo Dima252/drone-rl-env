@@ -16,6 +16,11 @@ hard end at once, where staying safe is the job.
 ``randomized`` is the direct measure of overfitting to those ranges. ``hold m`` is
 the true distance from the hold point while settled there.
 
+``jerk`` is the mean largest change in any output from one step to the next, out of a
+full range of 2. A policy that flips its commands can score well here and still
+shake a real vehicle, so ``nominal`` and ``randomized`` limit it. Detector noise keeps
+it higher under ``randomized``, even for a policy that does not chatter.
+
 The reward is not reported because it differs between drones.
 """
 
@@ -140,6 +145,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-crash-rate", type=float, default=0.02)
     parser.add_argument("--max-worst-case-crash-rate", type=float, default=0.10)
     parser.add_argument("--max-unseen-crash-rate", type=float, default=0.15)
+    parser.add_argument("--max-nominal-jerk", type=float, default=0.5)
+    parser.add_argument("--max-randomized-jerk", type=float, default=1.0)
     parser.add_argument(
         "--min-waypoint-rate",
         type=float,
@@ -176,9 +183,11 @@ def main() -> None:
         if name in SAFETY_ONLY:
             ok = result["crash_rate"] <= getattr(args, SAFETY_ONLY[name])
         else:
+            limit = args.max_nominal_jerk if name == "nominal" else args.max_randomized_jerk
             ok = (
                 result["crash_rate"] <= args.max_crash_rate
                 and result["any_waypoint"] >= min_waypoint_rate
+                and result["mean_action_change"] <= limit
             )
         passed = passed and ok
         print(

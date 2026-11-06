@@ -4,6 +4,9 @@ Progress is the difference of a potential, so it pays nothing once the vehicle
 stops. Proximity is what pulls a stationary vehicle in for the last metre: when it
 was weak, a policy settled 1.1 m off in perfect conditions. Arrival has to pay more
 than loitering just outside the arrival gate.
+
+Repeated arrivals make time valuable, so without a cost on speed a policy rushes in
+and overshoots. See docs/training-plan.md for why that loses a forward camera's view.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from envs.base_drone_env import _norm
 
 PROXIMITY_RADIUS_M = 0.7
 PROXIMITY_SPEED_MPS = 1.0
+SPEED_LIMIT_MPS = 1.0
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,7 @@ class WaypointRewardWeights:
     tilt: float  # Per step, per radian.
     rate: float  # Per step, per rad/s.
     facing: float = 0.0  # Per step, per radian off pointing at the marker.
+    speed: float = 0.0  # Per step, per m/s of ground speed over SPEED_LIMIT_MPS.
     crash: float = 100.0  # Once, on leaving the flight envelope.
 
 
@@ -52,6 +57,7 @@ def waypoint_reward(
     )
     jerk = float(np.sum((action - info["prev_action"]) ** 2))
     rate = _norm(next_state.angular_velocity)
+    excess_speed = max(_norm(next_state.velocity[:2]) - SPEED_LIMIT_MPS, 0.0)
 
     return (
         weights.progress * (before - after)
@@ -61,5 +67,6 @@ def waypoint_reward(
         - weights.tilt * next_state.tilt
         - weights.rate * rate
         - weights.facing * info.get("bearing_error", 0.0)
+        - weights.speed * excess_speed
         - (weights.crash if info["terminated"] else 0.0)
     )

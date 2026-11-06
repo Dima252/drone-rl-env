@@ -456,6 +456,24 @@ def test_sliding_along_the_ring_earns_no_progress():
     assert abs(reward) < 0.005  # A 5 m/s slide covers 0.1 m in one step.
 
 
+@pytest.mark.parametrize("speed, cost", [(0.5, 0.0), (1.0, 0.0), (3.0, 2.0)])
+def test_only_ground_speed_over_the_limit_costs_reward(speed, cost):
+    weights = WaypointRewardWeights(
+        progress=0.0, proximity=0.0, arrival=0.0, smoothness=0.0, tilt=0.0, rate=0.0, speed=1.0
+    )
+    env = MarkerHoldEnv(
+        lambda *args: waypoint_reward(weights, *args), perfect().config
+    )
+    env.reset(seed=0)
+    pose(env, distance=10.0, height=4.0)
+    env._data.qvel[1] = speed
+    mujoco.mj_forward(env._model, env._data)
+    env._state = env._read_state()
+
+    _, reward, *_ = env.step(HOVER)
+    assert reward == pytest.approx(-cost, abs=0.05)
+
+
 def test_nothing_pays_for_flying_past_the_hold_towards_the_marker():
     env = perfect()
     env._hold_range, env._hold_height = 10.0, 3.64

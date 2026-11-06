@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import numpy as np
@@ -14,10 +13,11 @@ WEIGHTS = WaypointRewardWeights(
     progress=5.0,
     proximity=1.0,
     arrival=50.0,
-    smoothness=float(os.environ.get("DRONE_SMOOTHNESS", "0.05")),
+    smoothness=0.5,
     tilt=0.0,
     rate=0.02,
     facing=0.3,
+    speed=0.5,
 )
 
 

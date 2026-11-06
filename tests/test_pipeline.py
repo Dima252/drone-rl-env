@@ -83,6 +83,7 @@ def test_evaluate_reports_every_scenario(trained):
         "agents.evaluate", str(trained), "--episodes", "1",
         "--max-crash-rate", "1.0", "--max-worst-case-crash-rate", "1.0",
         "--max-unseen-crash-rate", "1.0", "--min-waypoint-rate", "0.0",
+        "--max-nominal-jerk", "2.0", "--max-randomized-jerk", "2.0",
     )
     assert result.returncode == 0, result.stderr[-2000:]
     for scenario in ("nominal", "randomized", "worst case", "unseen", "PASS"):
@@ -103,6 +104,17 @@ def test_evaluate_fails_a_policy_that_survives_without_doing_the_job(trained):
         "agents.evaluate", str(trained), "--episodes", "1",
         "--max-crash-rate", "1.0", "--max-worst-case-crash-rate", "1.0",
         "--max-unseen-crash-rate", "1.0", "--min-waypoint-rate", "1.1",
+    )
+    assert result.returncode == 1
+    assert "FAIL" in result.stdout
+
+
+def test_evaluate_fails_a_policy_that_chatters(trained):
+    result = run(
+        "agents.evaluate", str(trained), "--episodes", "1",
+        "--max-crash-rate", "1.0", "--max-worst-case-crash-rate", "1.0",
+        "--max-unseen-crash-rate", "1.0", "--min-waypoint-rate", "0.0",
+        "--max-nominal-jerk", "-1", "--max-randomized-jerk", "2.0",
     )
     assert result.returncode == 1
     assert "FAIL" in result.stdout
